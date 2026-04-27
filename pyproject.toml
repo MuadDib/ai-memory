@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ai-memory"
+version = "0.1.0"
+description = "Local-first shared AI memory: tiered storage, hybrid search, MCP server, dream-style consolidation."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Igor Valjevic" }]
+
+dependencies = [
+    "fastmcp>=2.0,<3",          # MCP server framework
+    "sqlite-vec>=0.1.6",        # Vector search SQLite extension
+    "openai>=1.40",             # Default embeddings + LLM provider
+    "anthropic>=0.40",          # Default LLM for consolidation/dreaming
+    "pydantic>=2.7",            # Models, config validation
+    "pyyaml>=6.0",              # config.yaml
+    "python-ulid>=2.7",         # ULID identifiers
+    "click>=8.1",               # CLI
+    "platformdirs>=4.2",        # Cross-platform application data location
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+local-embeddings = [
+    "sentence-transformers>=3",
+    "onnxruntime>=1.18",
+]
+
+[project.scripts]
+ai-memory = "ai_memory.cli:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]  # we handle line length via formatter
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ai_memory"]

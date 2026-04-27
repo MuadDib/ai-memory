@@ -1,0 +1,9 @@
+{
+  "_comment": "Drop into ~/.cursor/mcp.json (or configure via Cursor Settings → MCP).",
+  "mcpServers": {
+    "ai-memory": {
+      "command": "ai-memory",
+      "args": ["serve"]
+    }
+  }
+}

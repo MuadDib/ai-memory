@@ -1,0 +1,13 @@
+{
+  "_comment": "Drop into %APPDATA%\\Claude\\claude_desktop_config.json (merge with existing).",
+  "mcpServers": {
+    "ai-memory": {
+      "command": "ai-memory",
+      "args": ["serve"],
+      "env": {
+        "OPENAI_API_KEY": "sk-...",
+        "ANTHROPIC_API_KEY": "sk-ant-..."
+      }
+    }
+  }
+}

@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.envrc
+
+# Tooling
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Editors
+.vscode/
+.idea/
+
+# Build
+build/
+dist/
+
+# Local memory data (never commit user content)
+memory.db
+memory.db-*
+profile.md
+raw/
+exports/
+logs/
+config.yaml
