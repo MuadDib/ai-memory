@@ -19,6 +19,7 @@ from fastmcp import FastMCP
 
 from ai_memory.config import Config
 from ai_memory.core.service import MemoryService
+from ai_memory.daemon import _claim_pid, _process_alive  # noqa: PLC2701
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,12 @@ def build_app(service: MemoryService) -> FastMCP:
 
 def serve_mcp(config: Config) -> None:
     """Boot the service and start the MCP stdio loop. Blocking call."""
+    pid_path = config.home / "mcp-server.pid"
+    if not _claim_pid(pid_path):
+        raise SystemExit(
+            f"Another ai-memory MCP server is already running (pid file: {pid_path}). "
+            "Kill it or delete the pid file before starting a new one."
+        )
     service = MemoryService.build(config)
     service.start()
     try:
@@ -110,3 +117,4 @@ def serve_mcp(config: Config) -> None:
         app.run()  # FastMCP handles stdio loop
     finally:
         service.stop()
+        pid_path.unlink(missing_ok=True)
