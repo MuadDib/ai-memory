@@ -24,7 +24,6 @@ from fastmcp import FastMCP
 
 from ai_memory.config import Config
 from ai_memory.core.service import MemoryService
-from ai_memory.daemon import _claim_pid, _process_alive  # noqa: PLC2701
 
 logger = logging.getLogger(__name__)
 
@@ -170,12 +169,10 @@ def serve_mcp(config: Config) -> None:
     # Attach a FileHandler so our logs always land in service-stderr.log.
     _attach_log_file(config)
 
-    pid_path = config.home / "mcp-server.pid"
-    if not _claim_pid(pid_path):
-        raise SystemExit(
-            f"Another ai-memory MCP server is already running (pid file: {pid_path}). "
-            "Kill it or delete the pid file before starting a new one."
-        )
+    # No PID lock here — Claude Desktop legitimately spawns one server process
+    # per connected window/project, so multiple instances are expected and fine.
+    # SQLite WAL mode + busy_timeout=15 000 ms handles concurrent writers safely.
+    # (The dream daemon keeps its own PID lock; dream cycles must not duplicate.)
     service = MemoryService.build(config)
     service.start()
     logger.info(
@@ -189,4 +186,3 @@ def serve_mcp(config: Config) -> None:
         app.run()  # FastMCP handles stdio loop
     finally:
         service.stop()
-        pid_path.unlink(missing_ok=True)
