@@ -13,6 +13,10 @@ which calls `serve_mcp(config)` below.
 from __future__ import annotations
 
 import logging
+import os
+import time
+import traceback
+from contextlib import contextmanager
 from dataclasses import asdict
 
 import anyio
@@ -23,6 +27,36 @@ from ai_memory.core.service import MemoryService
 from ai_memory.daemon import _claim_pid, _process_alive  # noqa: PLC2701
 
 logger = logging.getLogger(__name__)
+
+
+def _server_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("ai-memory")
+    except Exception:
+        return "unknown"
+
+
+_SLOW_TOOL_THRESHOLD_S = 5.0  # warn if a tool call takes longer than this
+
+
+@contextmanager
+def _timed_tool(name: str, **kw):
+    """Log start/finish/duration of every MCP tool call. Captures exceptions."""
+    extra = "  ".join(f"{k}={v!r}" for k, v in kw.items())
+    logger.info("tool.start  %s  %s", name, extra)
+    t0 = time.monotonic()
+    try:
+        yield
+        elapsed = time.monotonic() - t0
+        level = logging.WARNING if elapsed >= _SLOW_TOOL_THRESHOLD_S else logging.INFO
+        logger.log(level, "tool.finish %s  %.3fs", name, elapsed)
+    except Exception:
+        elapsed = time.monotonic() - t0
+        logger.error(
+            "tool.error  %s  %.3fs\n%s", name, elapsed, traceback.format_exc()
+        )
+        raise
 
 
 def build_app(service: MemoryService) -> FastMCP:
@@ -38,12 +72,13 @@ def build_app(service: MemoryService) -> FastMCP:
         Returns the new turn id, the episode id, and a list of any redactions
         the privacy filter applied.
         """
-        # Run in a worker thread so concurrent remembers don't queue up and
-        # block the event loop while waiting for the SQLite write lock.
-        result = await anyio.to_thread.run_sync(
-            lambda: service.remember(text=text, source=source, role=role)
-        )
-        return asdict(result)
+        with _timed_tool("memory_remember", source=source, role=role, chars=len(text)):
+            # Run in a worker thread so concurrent remembers don't queue up
+            # and block the event loop while waiting for the SQLite write lock.
+            result = await anyio.to_thread.run_sync(
+                lambda: service.remember(text=text, source=source, role=role)
+            )
+            return asdict(result)
 
     @app.tool()
     def memory_recall(query: str, depth: str = "deep", k: int = 8) -> list[dict]:
@@ -62,8 +97,9 @@ def build_app(service: MemoryService) -> FastMCP:
         that gating tier 2 behind a heuristic mis-fired with small corpora
         and tight embedding score distributions. Now they're identical.
         """
-        hits = service.recall(query=query, depth=depth, k=k)
-        return [asdict(h) for h in hits]
+        with _timed_tool("memory_recall", depth=depth, k=k):
+            hits = service.recall(query=query, depth=depth, k=k)
+            return [asdict(h) for h in hits]
 
     @app.tool()
     def memory_dream(trigger: str = "manual") -> dict:
@@ -72,20 +108,23 @@ def build_app(service: MemoryService) -> FastMCP:
         Heavy LLM work. Use sparingly during a session; let the scheduled /
         idle / pressure triggers do their job by default.
         """
-        report = service.dream(trigger=trigger)
-        return asdict(report)
+        with _timed_tool("memory_dream", trigger=trigger):
+            report = service.dream(trigger=trigger)
+            return asdict(report)
 
     @app.tool()
     def memory_recent_episodes(limit: int = 10) -> list[dict]:
         """List the most recent episodes by start time."""
-        episodes = service.list_recent_episodes(limit=limit)
-        return [asdict(e) for e in episodes]
+        with _timed_tool("memory_recent_episodes", limit=limit):
+            episodes = service.list_recent_episodes(limit=limit)
+            return [asdict(e) for e in episodes]
 
     @app.tool()
     def memory_dream_log(limit: int = 10) -> list[dict]:
         """Inspect recent dream-cycle passes."""
-        logs = service.list_recent_dream_logs(limit=limit)
-        return [asdict(l) for l in logs]
+        with _timed_tool("memory_dream_log", limit=limit):
+            logs = service.list_recent_dream_logs(limit=limit)
+            return [asdict(l) for l in logs]
 
     # --- Resources -------------------------------------------------------
 
@@ -117,6 +156,12 @@ def serve_mcp(config: Config) -> None:
         )
     service = MemoryService.build(config)
     service.start()
+    logger.info(
+        "mcp-server started: pid=%d version=%s home=%s",
+        os.getpid(),
+        _server_version(),
+        config.home,
+    )
     try:
         app = build_app(service)
         app.run()  # FastMCP handles stdio loop
