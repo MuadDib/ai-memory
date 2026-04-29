@@ -188,12 +188,17 @@ def _emit(log_path: Path, payload: dict) -> None:
         fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
-def _claim_pid(pid_path: Path) -> bool:
-    """Atomically claim a pidfile. Returns False if a live process already holds it."""
+def _claim_pid(pid_path: Path, expected_name: str = "ai-memory") -> bool:
+    """Atomically claim a pidfile. Returns False if a live ai-memory process already holds it.
+
+    `expected_name` is matched (case-insensitive, substring) against the
+    process executable name so that a recycled PID belonging to an unrelated
+    process (e.g. pwsh) doesn't block startup.
+    """
     if pid_path.exists():
         try:
             other_pid = int(pid_path.read_text().strip())
-            if _process_alive(other_pid):
+            if _process_alive(other_pid, expected_name=expected_name):
                 return False
         except (ValueError, OSError):
             pass  # stale or unreadable -> we'll overwrite
@@ -202,28 +207,55 @@ def _claim_pid(pid_path: Path) -> bool:
     return True
 
 
-def _process_alive(pid: int) -> bool:
-    """Cross-platform 'is this pid running' check."""
+def _process_alive(pid: int, expected_name: str | None = None) -> bool:
+    """Cross-platform 'is this pid running' check.
+
+    If `expected_name` is given (case-insensitive substring), the function
+    also verifies that the process executable contains that name.  This
+    guards against PID recycling: a recycled PID held by an unrelated
+    process (e.g. pwsh) looks alive but isn't *our* process.
+    """
     if pid <= 0:
         return False
     if os.name == "nt":
-        # On Windows, opening the process tells us if it exists.
         try:
             import ctypes
+            import ctypes.wintypes
 
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
             handle = ctypes.windll.kernel32.OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION, False, pid
             )
-            if handle:
-                ctypes.windll.kernel32.CloseHandle(handle)
+            if not handle:
+                return False
+            try:
+                if expected_name is not None:
+                    # QueryFullProcessImageNameW to get the exe path
+                    buf = ctypes.create_unicode_buffer(1024)
+                    size = ctypes.wintypes.DWORD(1024)
+                    ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                        handle, 0, buf, ctypes.byref(size)
+                    )
+                    if ok:
+                        exe_path = buf.value.lower()
+                        if expected_name.lower() not in exe_path:
+                            return False  # PID recycled by a different program
                 return True
-            return False
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
         except Exception:
             return False
     else:
         try:
             os.kill(pid, 0)
+            if expected_name is not None:
+                # Best-effort name check via /proc on Linux/macOS
+                try:
+                    exe = os.readlink(f"/proc/{pid}/exe")
+                    if expected_name.lower() not in exe.lower():
+                        return False
+                except OSError:
+                    pass  # /proc not available or unreadable — trust the signal
             return True
         except OSError:
             return False

@@ -29,6 +29,24 @@ from ai_memory.daemon import _claim_pid, _process_alive  # noqa: PLC2701
 logger = logging.getLogger(__name__)
 
 
+def _attach_log_file(config: Config) -> None:
+    """Add a FileHandler so MCP server logs land in service-stderr.log.
+
+    Claude Desktop runs `ai-memory serve` as an stdio subprocess and discards
+    its stderr (only stdout carries the MCP protocol).  Without this handler
+    every logger.info/warning/error call from the server process is silently
+    dropped — making the diagnostic log useless.  We attach the handler once,
+    early in serve_mcp(), before any other log calls.
+    """
+    config.logs_dir.mkdir(parents=True, exist_ok=True)
+    log_file = config.logs_dir / "service-stderr.log"
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    logging.getLogger().addHandler(fh)
+
+
 def _server_version() -> str:
     try:
         from importlib.metadata import version
@@ -148,6 +166,10 @@ def build_app(service: MemoryService) -> FastMCP:
 
 def serve_mcp(config: Config) -> None:
     """Boot the service and start the MCP stdio loop. Blocking call."""
+    # Claude Desktop discards MCP subprocess stderr (stdout carries the protocol).
+    # Attach a FileHandler so our logs always land in service-stderr.log.
+    _attach_log_file(config)
+
     pid_path = config.home / "mcp-server.pid"
     if not _claim_pid(pid_path):
         raise SystemExit(
