@@ -237,7 +237,8 @@ class SqliteStore:
             self.conn.commit()
 
     def list_profile(self) -> list[Profile]:
-        rows = self.conn.execute("SELECT * FROM profile ORDER BY key").fetchall()
+        with self._lock:
+            rows = self.conn.execute("SELECT * FROM profile ORDER BY key").fetchall()
         return [_row_to_profile(r) for r in rows]
 
     # --- Notes -----------------------------------------------------------
@@ -296,25 +297,27 @@ class SqliteStore:
             self.conn.commit()
 
     def get_note(self, note_id: str) -> Note | None:
-        row = self.conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
         return _row_to_note(row) if row else None
 
     def search_notes_vector(
         self, embedding: list[float], k: int, only_valid: bool = True
     ) -> list[tuple[Note, float]]:
         valid_clause = "AND notes.valid_to IS NULL" if only_valid else ""
-        rows = self.conn.execute(
-            f"""
-            SELECT notes.*, notes_vec.distance AS distance
-            FROM notes_vec
-            JOIN notes ON notes.id = notes_vec.note_id
-            WHERE notes_vec.embedding MATCH ?
-              AND k = ?
-              {valid_clause}
-            ORDER BY notes_vec.distance
-            """,
-            (_pack_vec(embedding), k),
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                f"""
+                SELECT notes.*, notes_vec.distance AS distance
+                FROM notes_vec
+                JOIN notes ON notes.id = notes_vec.note_id
+                WHERE notes_vec.embedding MATCH ?
+                  AND k = ?
+                  {valid_clause}
+                ORDER BY notes_vec.distance
+                """,
+                (_pack_vec(embedding), k),
+            ).fetchall()
         return [(_row_to_note(r), float(r["distance"])) for r in rows]
 
     def search_notes_bm25(
@@ -324,18 +327,19 @@ class SqliteStore:
         if not fts_query:
             return []  # nothing alphanumeric -> no BM25 hits
         valid_clause = "AND notes.valid_to IS NULL" if only_valid else ""
-        rows = self.conn.execute(
-            f"""
-            SELECT notes.*, bm25(notes_fts) AS rank
-            FROM notes_fts
-            JOIN notes ON notes.rowid = notes_fts.rowid
-            WHERE notes_fts MATCH ?
-              {valid_clause}
-            ORDER BY rank
-            LIMIT ?
-            """,
-            (fts_query, k),
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                f"""
+                SELECT notes.*, bm25(notes_fts) AS rank
+                FROM notes_fts
+                JOIN notes ON notes.rowid = notes_fts.rowid
+                WHERE notes_fts MATCH ?
+                  {valid_clause}
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (fts_query, k),
+            ).fetchall()
         return [(_row_to_note(r), float(r["rank"])) for r in rows]
 
     def invalidate_note(self, note_id: str, when: int, superseded_by: str | None) -> None:
@@ -357,16 +361,18 @@ class SqliteStore:
 
     def list_valid_notes(self) -> list[Note]:
         """Every note with valid_to IS NULL — used by the promotion clustering pass."""
-        rows = self.conn.execute(
-            "SELECT * FROM notes WHERE valid_to IS NULL ORDER BY ingested_at"
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM notes WHERE valid_to IS NULL ORDER BY ingested_at"
+            ).fetchall()
         return [_row_to_note(r) for r in rows]
 
     def get_note_embedding(self, note_id: str) -> list[float] | None:
         """Read back the stored vector for a note. Used to seed clustering against existing rows."""
-        row = self.conn.execute(
-            "SELECT embedding FROM notes_vec WHERE note_id = ?", (note_id,)
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT embedding FROM notes_vec WHERE note_id = ?", (note_id,)
+            ).fetchone()
         if row is None:
             return None
         blob = row["embedding"]
@@ -432,35 +438,39 @@ class SqliteStore:
             self.conn.commit()
 
     def get_episode(self, episode_id: str) -> Episode | None:
-        row = self.conn.execute("SELECT * FROM episodes WHERE id = ?", (episode_id,)).fetchone()
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM episodes WHERE id = ?", (episode_id,)).fetchone()
         return _row_to_episode(row) if row else None
 
     def list_recent_episodes(self, limit: int) -> list[Episode]:
-        rows = self.conn.execute(
-            "SELECT * FROM episodes ORDER BY started_at DESC LIMIT ?", (limit,)
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM episodes ORDER BY started_at DESC LIMIT ?", (limit,)
+            ).fetchall()
         return [_row_to_episode(r) for r in rows]
 
     def search_episodes_vector(
         self, embedding: list[float], k: int
     ) -> list[tuple[Episode, float]]:
-        rows = self.conn.execute(
-            """
-            SELECT episodes.*, episodes_vec.distance AS distance
-            FROM episodes_vec
-            JOIN episodes ON episodes.id = episodes_vec.episode_id
-            WHERE episodes_vec.embedding MATCH ?
-              AND k = ?
-            ORDER BY episodes_vec.distance
-            """,
-            (_pack_vec(embedding), k),
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT episodes.*, episodes_vec.distance AS distance
+                FROM episodes_vec
+                JOIN episodes ON episodes.id = episodes_vec.episode_id
+                WHERE episodes_vec.embedding MATCH ?
+                  AND k = ?
+                ORDER BY episodes_vec.distance
+                """,
+                (_pack_vec(embedding), k),
+            ).fetchall()
         return [(_row_to_episode(r), float(r["distance"])) for r in rows]
 
     def episodes_since(self, ts: int) -> list[Episode]:
-        rows = self.conn.execute(
-            "SELECT * FROM episodes WHERE started_at >= ? ORDER BY started_at", (ts,)
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM episodes WHERE started_at >= ? ORDER BY started_at", (ts,)
+            ).fetchall()
         return [_row_to_episode(r) for r in rows]
 
     def mark_episode_consolidated(self, episode_id: str, when: int) -> None:
@@ -484,13 +494,17 @@ class SqliteStore:
             self.conn.commit()
 
     def get_turns_for_episode(self, episode_id: str) -> list[Turn]:
-        rows = self.conn.execute(
-            "SELECT * FROM turns WHERE episode_id = ? ORDER BY ts", (episode_id,)
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM turns WHERE episode_id = ? ORDER BY ts", (episode_id,)
+            ).fetchall()
         return [_row_to_turn(r) for r in rows]
 
     def count_turns_since(self, ts: int) -> int:
-        row = self.conn.execute("SELECT COUNT(*) AS n FROM turns WHERE ts >= ?", (ts,)).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM turns WHERE ts >= ?", (ts,)
+            ).fetchone()
         return int(row["n"]) if row else 0
 
     # --- Dream log -------------------------------------------------------
@@ -536,23 +550,26 @@ class SqliteStore:
             self.conn.commit()
 
     def list_recent_dream_logs(self, limit: int) -> list[DreamLog]:
-        rows = self.conn.execute(
-            "SELECT * FROM dream_log ORDER BY started_at DESC LIMIT ?", (limit,)
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM dream_log ORDER BY started_at DESC LIMIT ?", (limit,)
+            ).fetchall()
         return [_row_to_dream_log(r) for r in rows]
 
     def last_dream_completed_at(self) -> int | None:
-        row = self.conn.execute(
-            "SELECT MAX(ended_at) AS last FROM dream_log WHERE ended_at IS NOT NULL"
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT MAX(ended_at) AS last FROM dream_log WHERE ended_at IS NOT NULL"
+            ).fetchone()
         return int(row["last"]) if row and row["last"] is not None else None
 
     # --- Cowork importer state ------------------------------------------
 
     def get_cowork_import_state(self, session_id: str) -> CoworkImportState | None:
-        row = self.conn.execute(
-            "SELECT * FROM cowork_import_state WHERE session_id = ?", (session_id,)
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM cowork_import_state WHERE session_id = ?", (session_id,)
+            ).fetchone()
         if row is None:
             return None
         return CoworkImportState(

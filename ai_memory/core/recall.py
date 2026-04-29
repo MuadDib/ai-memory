@@ -24,7 +24,6 @@ from __future__ import annotations
 import logging
 import math
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -80,22 +79,21 @@ def recall(
     now = int(now if now is not None else time.time())
     t0 = time.monotonic()
 
-    # 1. Embed the query AND run BM25 in parallel.
-    #    BM25 is a pure SQLite FTS5 scan — it doesn't need the embedding.
-    #    Overlapping it with the ~2 s OpenAI round-trip shaves a few hundred ms
-    #    off every recall at no extra cost.
-    with ThreadPoolExecutor(max_workers=2) as _pool:
-        _t_parallel = time.monotonic()
-        _embed_fut = _pool.submit(embedder.embed, [request.query])
-        _bm25_fut  = _pool.submit(store.search_notes_bm25, request.query, config.bm25_candidates)
-        [query_embedding] = _embed_fut.result()   # blocks until embedding ready
-        _t_embed_done = time.monotonic()
-        bm25_hits = _bm25_fut.result()            # almost certainly done by now
-        _t_bm25_done = time.monotonic()
-    _embed_ms = (_t_embed_done - _t_parallel) * 1000
-    _bm25_ms  = (_t_bm25_done - _t_embed_done) * 1000  # extra wait after embed, if any
+    # 1. Embed the query.
+    #    NOTE: BM25 was previously overlapped with embedding via ThreadPoolExecutor,
+    #    but that caused deadlocks when multiple recall threads accessed the shared
+    #    sqlite3 connection concurrently (sqlite3 connections are not thread-safe).
+    #    The ~5 ms BM25 saving is not worth the complexity; keep it sequential.
+    _t_embed = time.monotonic()
+    [query_embedding] = embedder.embed([request.query])
+    _embed_ms = (time.monotonic() - _t_embed) * 1000
 
-    # 2. Vector search (needs the embedding from step 1).
+    # 2. BM25 (sequential, safe — single thread per recall invocation).
+    _t_bm25 = time.monotonic()
+    bm25_hits = store.search_notes_bm25(request.query, config.bm25_candidates)
+    _bm25_ms = (time.monotonic() - _t_bm25) * 1000
+
+    # 3. Vector search (needs the embedding from step 1).
     _t_vec = time.monotonic()
     vector_hits_raw = store.search_notes_vector(
         query_embedding, k=config.vector_candidates, only_valid=True
@@ -109,7 +107,7 @@ def recall(
         logger.info(
             "recall query=%r vector_candidates=%d dist_min=%.3f dist_p50=%.3f "
             "dist_max=%.3f floor=%.3f bm25_candidates=%d "
-            "t_embed=%.0fms t_bm25_wait=%.0fms t_vec=%.0fms",
+            "t_embed=%.0fms t_bm25=%.0fms t_vec=%.0fms",
             request.query,
             len(vector_hits_raw),
             min(dists),
@@ -122,7 +120,7 @@ def recall(
     else:
         logger.info(
             "recall query=%r vector_candidates=0 bm25_candidates=%d "
-            "t_embed=%.0fms t_bm25_wait=%.0fms t_vec=%.0fms",
+            "t_embed=%.0fms t_bm25=%.0fms t_vec=%.0fms",
             request.query, len(bm25_hits),
             _embed_ms, _bm25_ms, _vec_ms,
         )
@@ -241,6 +239,6 @@ def recall(
         "recall done hits=%d total=%.0fms  (embed=%.0fms bm25_wait=%.0fms vec=%.0fms ep=%.0fms)",
         len(note_hits),
         (time.monotonic() - t0) * 1000,
-        _embed_ms, _bm25_ms, _vec_ms, _ep_ms,
+        _embed_ms, _bm25_ms, _vec_ms, _ep_ms
     )
     return note_hits
