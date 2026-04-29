@@ -98,7 +98,7 @@ def build_app(service: MemoryService) -> FastMCP:
             return asdict(result)
 
     @app.tool()
-    def memory_recall(query: str, depth: str = "deep", k: int = 8) -> list[dict]:
+    async def memory_recall(query: str, depth: str = "deep", k: int = 8) -> list[dict]:
         """Retrieve relevant memories.
 
         Always returns a merged ranking across atomic notes (Tier 1) and
@@ -115,7 +115,11 @@ def build_app(service: MemoryService) -> FastMCP:
         and tight embedding score distributions. Now they're identical.
         """
         with _timed_tool("memory_recall", depth=depth, k=k):
-            hits = service.recall(query=query, depth=depth, k=k)
+            # Offload to a worker thread: the OpenAI embeddings call (~2 s) would
+            # otherwise block the event loop and queue every other tool call behind it.
+            hits = await anyio.to_thread.run_sync(
+                lambda: service.recall(query=query, depth=depth, k=k)
+            )
             return [asdict(h) for h in hits]
 
     @app.tool()

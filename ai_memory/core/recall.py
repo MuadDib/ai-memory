@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -78,14 +79,20 @@ def recall(
     """Run the recall pipeline. Returns a ranked list of hits."""
     now = int(now if now is not None else time.time())
 
-    # 1. Embed the query once.
-    [query_embedding] = embedder.embed([request.query])
+    # 1. Embed the query AND run BM25 in parallel.
+    #    BM25 is a pure SQLite FTS5 scan — it doesn't need the embedding.
+    #    Overlapping it with the ~2 s OpenAI round-trip shaves a few hundred ms
+    #    off every recall at no extra cost.
+    with ThreadPoolExecutor(max_workers=2) as _pool:
+        _embed_fut = _pool.submit(embedder.embed, [request.query])
+        _bm25_fut  = _pool.submit(store.search_notes_bm25, request.query, config.bm25_candidates)
+        [query_embedding] = _embed_fut.result()   # blocks until embedding ready
+        bm25_hits          = _bm25_fut.result()   # almost certainly done by now
 
-    # 2. Pull candidates from each ranker.
+    # 2. Vector search (needs the embedding from step 1).
     vector_hits_raw = store.search_notes_vector(
         query_embedding, k=config.vector_candidates, only_valid=True
     )
-    bm25_hits = store.search_notes_bm25(request.query, k=config.bm25_candidates)
 
     # Diagnostic: log the live distance distribution so the floor can be
     # tuned from data rather than guesswork. Cheap; runs every recall.
