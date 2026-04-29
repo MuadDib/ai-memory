@@ -78,21 +78,29 @@ def recall(
 ) -> list[RecallHit]:
     """Run the recall pipeline. Returns a ranked list of hits."""
     now = int(now if now is not None else time.time())
+    t0 = time.monotonic()
 
     # 1. Embed the query AND run BM25 in parallel.
     #    BM25 is a pure SQLite FTS5 scan — it doesn't need the embedding.
     #    Overlapping it with the ~2 s OpenAI round-trip shaves a few hundred ms
     #    off every recall at no extra cost.
     with ThreadPoolExecutor(max_workers=2) as _pool:
+        _t_parallel = time.monotonic()
         _embed_fut = _pool.submit(embedder.embed, [request.query])
         _bm25_fut  = _pool.submit(store.search_notes_bm25, request.query, config.bm25_candidates)
         [query_embedding] = _embed_fut.result()   # blocks until embedding ready
-        bm25_hits          = _bm25_fut.result()   # almost certainly done by now
+        _t_embed_done = time.monotonic()
+        bm25_hits = _bm25_fut.result()            # almost certainly done by now
+        _t_bm25_done = time.monotonic()
+    _embed_ms = (_t_embed_done - _t_parallel) * 1000
+    _bm25_ms  = (_t_bm25_done - _t_embed_done) * 1000  # extra wait after embed, if any
 
     # 2. Vector search (needs the embedding from step 1).
+    _t_vec = time.monotonic()
     vector_hits_raw = store.search_notes_vector(
         query_embedding, k=config.vector_candidates, only_valid=True
     )
+    _vec_ms = (time.monotonic() - _t_vec) * 1000
 
     # Diagnostic: log the live distance distribution so the floor can be
     # tuned from data rather than guesswork. Cheap; runs every recall.
@@ -100,7 +108,8 @@ def recall(
         dists = [d for _, d in vector_hits_raw]
         logger.info(
             "recall query=%r vector_candidates=%d dist_min=%.3f dist_p50=%.3f "
-            "dist_max=%.3f floor=%.3f bm25_candidates=%d",
+            "dist_max=%.3f floor=%.3f bm25_candidates=%d "
+            "t_embed=%.0fms t_bm25_wait=%.0fms t_vec=%.0fms",
             request.query,
             len(vector_hits_raw),
             min(dists),
@@ -108,11 +117,14 @@ def recall(
             max(dists),
             config.vector_distance_floor,
             len(bm25_hits),
+            _embed_ms, _bm25_ms, _vec_ms,
         )
     else:
         logger.info(
-            "recall query=%r vector_candidates=0 bm25_candidates=%d",
+            "recall query=%r vector_candidates=0 bm25_candidates=%d "
+            "t_embed=%.0fms t_bm25_wait=%.0fms t_vec=%.0fms",
             request.query, len(bm25_hits),
+            _embed_ms, _bm25_ms, _vec_ms,
         )
 
     # Drop semantic-noise candidates: anything past the distance floor is
@@ -171,15 +183,18 @@ def recall(
     # include episodes; the merged ranking surfaces whichever tier had the better
     # match. The `depth` parameter now only controls whether we *also* expand
     # into raw verbatim turns (depth=verbatim), which is genuinely expensive.
+    _t_ep = time.monotonic()
     episode_hits_raw = store.search_episodes_vector(query_embedding, k=config.deep_k)
+    _ep_ms = (time.monotonic() - _t_ep) * 1000
     if episode_hits_raw:
         ep_dists = [d for _, d in episode_hits_raw]
         logger.info(
-            "recall episode_candidates=%d dist_min=%.3f dist_p50=%.3f dist_max=%.3f",
+            "recall episode_candidates=%d dist_min=%.3f dist_p50=%.3f dist_max=%.3f t_ep=%.0fms",
             len(ep_dists),
             min(ep_dists),
             sorted(ep_dists)[len(ep_dists) // 2],
             max(ep_dists),
+            _ep_ms,
         )
     episode_hits = [
         RecallHit(
@@ -222,4 +237,10 @@ def recall(
                 )
         note_hits.extend(verbatim_hits)
 
+    logger.info(
+        "recall done hits=%d total=%.0fms  (embed=%.0fms bm25_wait=%.0fms vec=%.0fms ep=%.0fms)",
+        len(note_hits),
+        (time.monotonic() - t0) * 1000,
+        _embed_ms, _bm25_ms, _vec_ms, _ep_ms,
+    )
     return note_hits
