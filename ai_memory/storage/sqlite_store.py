@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import struct
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -151,13 +152,17 @@ class SqliteStore:
         self._db_path = db_path
         self._embedding_dim = embedding_dim
         self._conn: sqlite3.Connection | None = None
+        # Reentrant lock so the same thread can nest calls (e.g. insert_note
+        # touches three tables in one method). check_same_thread=False lets
+        # worker threads (anyio.to_thread.run_sync callers) use this store.
+        self._lock = threading.RLock()
 
     # --- Lifecycle -------------------------------------------------------
 
     def initialise(self) -> None:
         """Open the connection, load sqlite-vec, create schema, ensure vec/fts tables."""
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self._db_path)
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
@@ -196,22 +201,24 @@ class SqliteStore:
     # --- Profile ---------------------------------------------------------
 
     def upsert_profile(self, profile: Profile) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO profile(key, value, updated_at, source)
-            VALUES(:key, :value, :updated_at, :source)
-            ON CONFLICT(key) DO UPDATE SET
-              value      = excluded.value,
-              updated_at = excluded.updated_at,
-              source     = excluded.source
-            """,
-            profile.__dict__,
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO profile(key, value, updated_at, source)
+                VALUES(:key, :value, :updated_at, :source)
+                ON CONFLICT(key) DO UPDATE SET
+                  value      = excluded.value,
+                  updated_at = excluded.updated_at,
+                  source     = excluded.source
+                """,
+                profile.__dict__,
+            )
+            self.conn.commit()
 
     def delete_profile(self, key: str) -> None:
-        self.conn.execute("DELETE FROM profile WHERE key = ?", (key,))
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute("DELETE FROM profile WHERE key = ?", (key,))
+            self.conn.commit()
 
     def list_profile(self) -> list[Profile]:
         rows = self.conn.execute("SELECT * FROM profile ORDER BY key").fetchall()
@@ -220,55 +227,57 @@ class SqliteStore:
     # --- Notes -----------------------------------------------------------
 
     def insert_note(self, note: Note, embedding: list[float]) -> None:
-        cur = self.conn.execute(
-            """
-            INSERT INTO notes(
-                id, text, tags, source_episode_ids, valid_from, valid_to,
-                ingested_at, superseded_by, contradicts, promoted_to_profile,
-                embedding_model, access_count, last_accessed_at
-            ) VALUES (
-                :id, :text, :tags, :source_episode_ids, :valid_from, :valid_to,
-                :ingested_at, :superseded_by, :contradicts, :promoted_to_profile,
-                :embedding_model, :access_count, :last_accessed_at
+        with self._lock:
+            cur = self.conn.execute(
+                """
+                INSERT INTO notes(
+                    id, text, tags, source_episode_ids, valid_from, valid_to,
+                    ingested_at, superseded_by, contradicts, promoted_to_profile,
+                    embedding_model, access_count, last_accessed_at
+                ) VALUES (
+                    :id, :text, :tags, :source_episode_ids, :valid_from, :valid_to,
+                    :ingested_at, :superseded_by, :contradicts, :promoted_to_profile,
+                    :embedding_model, :access_count, :last_accessed_at
+                )
+                """,
+                _note_to_row(note),
             )
-            """,
-            _note_to_row(note),
-        )
-        self.conn.execute(
-            "INSERT INTO notes_fts(rowid, text) VALUES (?, ?)", (cur.lastrowid, note.text)
-        )
-        self.conn.execute(
-            "INSERT INTO notes_vec(note_id, embedding) VALUES (?, ?)",
-            (note.id, _pack_vec(embedding)),
-        )
-        self.conn.commit()
+            self.conn.execute(
+                "INSERT INTO notes_fts(rowid, text) VALUES (?, ?)", (cur.lastrowid, note.text)
+            )
+            self.conn.execute(
+                "INSERT INTO notes_vec(note_id, embedding) VALUES (?, ?)",
+                (note.id, _pack_vec(embedding)),
+            )
+            self.conn.commit()
 
     def update_note(self, note: Note) -> None:
-        self.conn.execute(
-            """
-            UPDATE notes SET
-                text = :text,
-                tags = :tags,
-                source_episode_ids = :source_episode_ids,
-                valid_from = :valid_from,
-                valid_to = :valid_to,
-                superseded_by = :superseded_by,
-                contradicts = :contradicts,
-                promoted_to_profile = :promoted_to_profile,
-                access_count = :access_count,
-                last_accessed_at = :last_accessed_at
-            WHERE id = :id
-            """,
-            _note_to_row(note),
-        )
-        # Keep FTS in sync (rebuild row for this id)
-        cur = self.conn.execute("SELECT rowid FROM notes WHERE id = ?", (note.id,)).fetchone()
-        if cur:
-            self.conn.execute("DELETE FROM notes_fts WHERE rowid = ?", (cur["rowid"],))
+        with self._lock:
             self.conn.execute(
-                "INSERT INTO notes_fts(rowid, text) VALUES (?, ?)", (cur["rowid"], note.text)
+                """
+                UPDATE notes SET
+                    text = :text,
+                    tags = :tags,
+                    source_episode_ids = :source_episode_ids,
+                    valid_from = :valid_from,
+                    valid_to = :valid_to,
+                    superseded_by = :superseded_by,
+                    contradicts = :contradicts,
+                    promoted_to_profile = :promoted_to_profile,
+                    access_count = :access_count,
+                    last_accessed_at = :last_accessed_at
+                WHERE id = :id
+                """,
+                _note_to_row(note),
             )
-        self.conn.commit()
+            # Keep FTS in sync (rebuild row for this id)
+            cur = self.conn.execute("SELECT rowid FROM notes WHERE id = ?", (note.id,)).fetchone()
+            if cur:
+                self.conn.execute("DELETE FROM notes_fts WHERE rowid = ?", (cur["rowid"],))
+                self.conn.execute(
+                    "INSERT INTO notes_fts(rowid, text) VALUES (?, ?)", (cur["rowid"], note.text)
+                )
+            self.conn.commit()
 
     def get_note(self, note_id: str) -> Note | None:
         row = self.conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
@@ -314,19 +323,21 @@ class SqliteStore:
         return [(_row_to_note(r), float(r["rank"])) for r in rows]
 
     def invalidate_note(self, note_id: str, when: int, superseded_by: str | None) -> None:
-        self.conn.execute(
-            "UPDATE notes SET valid_to = ?, superseded_by = ? WHERE id = ?",
-            (when, superseded_by, note_id),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "UPDATE notes SET valid_to = ?, superseded_by = ? WHERE id = ?",
+                (when, superseded_by, note_id),
+            )
+            self.conn.commit()
 
     def bump_note_access(self, note_id: str, when: int) -> None:
         """Bump access_count + last_accessed_at when a note is reused (e.g. dedup hit)."""
-        self.conn.execute(
-            "UPDATE notes SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?",
-            (when, note_id),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "UPDATE notes SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?",
+                (when, note_id),
+            )
+            self.conn.commit()
 
     def list_valid_notes(self) -> list[Note]:
         """Every note with valid_to IS NULL — used by the promotion clustering pass."""
@@ -351,24 +362,25 @@ class SqliteStore:
     # --- Episodes --------------------------------------------------------
 
     def insert_episode(self, episode: Episode, embedding: list[float] | None = None) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO episodes(
-                id, title, summary, source, started_at, ended_at,
-                raw_file, embedding_model, consolidated_at
-            ) VALUES (
-                :id, :title, :summary, :source, :started_at, :ended_at,
-                :raw_file, :embedding_model, :consolidated_at
-            )
-            """,
-            episode.__dict__,
-        )
-        if embedding is not None:
+        with self._lock:
             self.conn.execute(
-                "INSERT INTO episodes_vec(episode_id, embedding) VALUES (?, ?)",
-                (episode.id, _pack_vec(embedding)),
+                """
+                INSERT INTO episodes(
+                    id, title, summary, source, started_at, ended_at,
+                    raw_file, embedding_model, consolidated_at
+                ) VALUES (
+                    :id, :title, :summary, :source, :started_at, :ended_at,
+                    :raw_file, :embedding_model, :consolidated_at
+                )
+                """,
+                episode.__dict__,
             )
-        self.conn.commit()
+            if embedding is not None:
+                self.conn.execute(
+                    "INSERT INTO episodes_vec(episode_id, embedding) VALUES (?, ?)",
+                    (episode.id, _pack_vec(embedding)),
+                )
+            self.conn.commit()
 
     def update_episode(self, episode: Episode, embedding: list[float] | None = None) -> None:
         """Replace an episode row in place; optionally re-embed its summary.
@@ -376,31 +388,32 @@ class SqliteStore:
         Used by the dream cycle when Phase 3 attaches a real summary/title to a
         bootstrapped episode that was opened with empty fields.
         """
-        self.conn.execute(
-            """
-            UPDATE episodes SET
-                title           = :title,
-                summary         = :summary,
-                source          = :source,
-                started_at      = :started_at,
-                ended_at        = :ended_at,
-                raw_file        = :raw_file,
-                embedding_model = :embedding_model,
-                consolidated_at = :consolidated_at
-            WHERE id = :id
-            """,
-            episode.__dict__,
-        )
-        if embedding is not None:
-            # Drop and re-insert the vector row — sqlite-vec doesn't expose UPDATE.
+        with self._lock:
             self.conn.execute(
-                "DELETE FROM episodes_vec WHERE episode_id = ?", (episode.id,)
+                """
+                UPDATE episodes SET
+                    title           = :title,
+                    summary         = :summary,
+                    source          = :source,
+                    started_at      = :started_at,
+                    ended_at        = :ended_at,
+                    raw_file        = :raw_file,
+                    embedding_model = :embedding_model,
+                    consolidated_at = :consolidated_at
+                WHERE id = :id
+                """,
+                episode.__dict__,
             )
-            self.conn.execute(
-                "INSERT INTO episodes_vec(episode_id, embedding) VALUES (?, ?)",
-                (episode.id, _pack_vec(embedding)),
-            )
-        self.conn.commit()
+            if embedding is not None:
+                # Drop and re-insert the vector row — sqlite-vec doesn't expose UPDATE.
+                self.conn.execute(
+                    "DELETE FROM episodes_vec WHERE episode_id = ?", (episode.id,)
+                )
+                self.conn.execute(
+                    "INSERT INTO episodes_vec(episode_id, embedding) VALUES (?, ?)",
+                    (episode.id, _pack_vec(embedding)),
+                )
+            self.conn.commit()
 
     def get_episode(self, episode_id: str) -> Episode | None:
         row = self.conn.execute("SELECT * FROM episodes WHERE id = ?", (episode_id,)).fetchone()
@@ -435,22 +448,24 @@ class SqliteStore:
         return [_row_to_episode(r) for r in rows]
 
     def mark_episode_consolidated(self, episode_id: str, when: int) -> None:
-        self.conn.execute(
-            "UPDATE episodes SET consolidated_at = ? WHERE id = ?", (when, episode_id)
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "UPDATE episodes SET consolidated_at = ? WHERE id = ?", (when, episode_id)
+            )
+            self.conn.commit()
 
     # --- Turns -----------------------------------------------------------
 
     def insert_turn(self, turn: Turn) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO turns(id, episode_id, raw_file, byte_offset, byte_length, role, ts)
-            VALUES (:id, :episode_id, :raw_file, :byte_offset, :byte_length, :role, :ts)
-            """,
-            turn.__dict__,
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO turns(id, episode_id, raw_file, byte_offset, byte_length, role, ts)
+                VALUES (:id, :episode_id, :raw_file, :byte_offset, :byte_length, :role, :ts)
+                """,
+                turn.__dict__,
+            )
+            self.conn.commit()
 
     def get_turns_for_episode(self, episode_id: str) -> list[Turn]:
         rows = self.conn.execute(
@@ -465,42 +480,44 @@ class SqliteStore:
     # --- Dream log -------------------------------------------------------
 
     def insert_dream_log(self, entry: DreamLog) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO dream_log(
-                id, started_at, ended_at, trigger,
-                episodes_processed, notes_added, notes_invalidated,
-                notes_promoted_to_profile, notes_pruned,
-                llm_tokens_used, llm_cost_usd, journal
-            ) VALUES (
-                :id, :started_at, :ended_at, :trigger,
-                :episodes_processed, :notes_added, :notes_invalidated,
-                :notes_promoted_to_profile, :notes_pruned,
-                :llm_tokens_used, :llm_cost_usd, :journal
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO dream_log(
+                    id, started_at, ended_at, trigger,
+                    episodes_processed, notes_added, notes_invalidated,
+                    notes_promoted_to_profile, notes_pruned,
+                    llm_tokens_used, llm_cost_usd, journal
+                ) VALUES (
+                    :id, :started_at, :ended_at, :trigger,
+                    :episodes_processed, :notes_added, :notes_invalidated,
+                    :notes_promoted_to_profile, :notes_pruned,
+                    :llm_tokens_used, :llm_cost_usd, :journal
+                )
+                """,
+                entry.__dict__,
             )
-            """,
-            entry.__dict__,
-        )
-        self.conn.commit()
+            self.conn.commit()
 
     def update_dream_log(self, entry: DreamLog) -> None:
-        self.conn.execute(
-            """
-            UPDATE dream_log SET
-                ended_at = :ended_at,
-                episodes_processed = :episodes_processed,
-                notes_added = :notes_added,
-                notes_invalidated = :notes_invalidated,
-                notes_promoted_to_profile = :notes_promoted_to_profile,
-                notes_pruned = :notes_pruned,
-                llm_tokens_used = :llm_tokens_used,
-                llm_cost_usd = :llm_cost_usd,
-                journal = :journal
-            WHERE id = :id
-            """,
-            entry.__dict__,
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE dream_log SET
+                    ended_at = :ended_at,
+                    episodes_processed = :episodes_processed,
+                    notes_added = :notes_added,
+                    notes_invalidated = :notes_invalidated,
+                    notes_promoted_to_profile = :notes_promoted_to_profile,
+                    notes_pruned = :notes_pruned,
+                    llm_tokens_used = :llm_tokens_used,
+                    llm_cost_usd = :llm_cost_usd,
+                    journal = :journal
+                WHERE id = :id
+                """,
+                entry.__dict__,
+            )
+            self.conn.commit()
 
     def list_recent_dream_logs(self, limit: int) -> list[DreamLog]:
         rows = self.conn.execute(
@@ -530,21 +547,22 @@ class SqliteStore:
         )
 
     def upsert_cowork_import_state(self, state: CoworkImportState) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO cowork_import_state(
-                session_id, last_turn_id, last_byte_offset, last_imported_at
-            ) VALUES (
-                :session_id, :last_turn_id, :last_byte_offset, :last_imported_at
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO cowork_import_state(
+                    session_id, last_turn_id, last_byte_offset, last_imported_at
+                ) VALUES (
+                    :session_id, :last_turn_id, :last_byte_offset, :last_imported_at
+                )
+                ON CONFLICT(session_id) DO UPDATE SET
+                  last_turn_id     = excluded.last_turn_id,
+                  last_byte_offset = excluded.last_byte_offset,
+                  last_imported_at = excluded.last_imported_at
+                """,
+                state.__dict__,
             )
-            ON CONFLICT(session_id) DO UPDATE SET
-              last_turn_id     = excluded.last_turn_id,
-              last_byte_offset = excluded.last_byte_offset,
-              last_imported_at = excluded.last_imported_at
-            """,
-            state.__dict__,
-        )
-        self.conn.commit()
+            self.conn.commit()
 
 
 # --- Row <-> dataclass helpers (kept private) ---------------------------

@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict
 
+import anyio
 from fastmcp import FastMCP
 
 from ai_memory.config import Config
@@ -31,13 +32,17 @@ def build_app(service: MemoryService) -> FastMCP:
     # --- Tools -----------------------------------------------------------
 
     @app.tool()
-    def memory_remember(text: str, source: str, role: str = "user") -> dict:
+    async def memory_remember(text: str, source: str, role: str = "user") -> dict:
         """Store a piece of text as a turn in the active episode for `source`.
 
         Returns the new turn id, the episode id, and a list of any redactions
         the privacy filter applied.
         """
-        result = service.remember(text=text, source=source, role=role)
+        # Run in a worker thread so concurrent remembers don't queue up and
+        # block the event loop while waiting for the SQLite write lock.
+        result = await anyio.to_thread.run_sync(
+            lambda: service.remember(text=text, source=source, role=role)
+        )
         return asdict(result)
 
     @app.tool()
