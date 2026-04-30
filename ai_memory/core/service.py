@@ -16,7 +16,6 @@ tests pass alternative components directly to `__init__` for substitution.
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass
 
 from ulid import ULID
@@ -33,6 +32,7 @@ from ai_memory.llm.interface import Llm
 from ai_memory.storage.interface import MemoryStore
 from ai_memory.storage.raw_files import RawTranscriptStore
 from ai_memory.storage.sqlite_store import SqliteStore
+from ai_memory.timestamps import now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +119,7 @@ class MemoryService:
         )
 
     def dream(
-        self, *, trigger: str = "manual", since: int | None = None
+        self, *, trigger: str = "manual", since: str | None = None
     ) -> _dreaming.DreamReport:
         """Run a consolidation pass."""
         return _dreaming.dream(
@@ -134,7 +134,7 @@ class MemoryService:
     def upsert_profile(self, key: str, value: str, source: str | None = None) -> None:
         """Insert / update a Tier 0 profile fact and re-mirror to profile.md."""
         self.store.upsert_profile(
-            Profile(key=key, value=value, updated_at=int(time.time()), source=source)
+            Profile(key=key, value=value, updated_at=now_iso(), source=source)
         )
         self._regenerate_profile_md()
 
@@ -149,7 +149,7 @@ class MemoryService:
 
     def add_note(self, *, text: str, tags: list[str] | None = None) -> str:
         """Insert a Tier 1 note directly (used by bootstrap; dreaming uses this too)."""
-        now = int(time.time())
+        now = now_iso()
         [embedding] = self.embedder.embed([text])
         note = Note(
             id=str(ULID()),

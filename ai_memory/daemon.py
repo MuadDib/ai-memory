@@ -36,6 +36,7 @@ from pathlib import Path
 
 from ai_memory.config import Config
 from ai_memory.core.service import MemoryService
+from ai_memory.timestamps import now_iso, unix_to_iso
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +121,7 @@ def _tick(*, service: MemoryService, state: DaemonRunState, log_path: Path) -> N
         return
 
     # 2) Pressure trigger
-    last_dream_completed = service.store.last_dream_completed_at() or 0
+    last_dream_completed = service.store.last_dream_completed_at() or "1970-01-01T00:00:00Z"
     new_turns = service.store.count_turns_since(last_dream_completed)
     if new_turns >= service.config.dream.pressure_trigger_turns:
         _run_pass(service, "pressure", log_path, extra={"new_turns": new_turns})
@@ -129,7 +130,9 @@ def _tick(*, service: MemoryService, state: DaemonRunState, log_path: Path) -> N
 
     # 3) Idle trigger
     idle_threshold_seconds = service.config.dream.idle_trigger_minutes * 60
-    no_recent_turns = service.store.count_turns_since(now_unix - idle_threshold_seconds) == 0
+    no_recent_turns = service.store.count_turns_since(
+        unix_to_iso(now_unix - idle_threshold_seconds)
+    ) == 0
     has_unconsolidated = any(
         ep.consolidated_at is None
         for ep in service.store.episodes_since(last_dream_completed)
@@ -149,7 +152,7 @@ def _tick(*, service: MemoryService, state: DaemonRunState, log_path: Path) -> N
             {
                 "event": "heartbeat",
                 "new_turns_since_last_dream": new_turns,
-                "last_dream_completed_at": last_dream_completed,
+                "last_dream_completed_at": last_dream_completed,  # already ISO string
             },
         )
 
@@ -182,7 +185,7 @@ def _run_pass(
 
 def _emit(log_path: Path, payload: dict) -> None:
     """Append one JSON line to the daemon log."""
-    payload = {"ts": int(time.time()), **payload}
+    payload = {"ts": now_iso(), **payload}
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(payload, ensure_ascii=False) + "\n")

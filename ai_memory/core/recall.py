@@ -31,6 +31,7 @@ from ai_memory.config import RecallConfig
 from ai_memory.core.models import RecallHit
 from ai_memory.embeddings.interface import Embedder
 from ai_memory.storage.raw_files import RawTranscriptStore
+from ai_memory.timestamps import iso_to_dt, now_iso
 
 if TYPE_CHECKING:
     from ai_memory.storage.interface import MemoryStore
@@ -73,10 +74,10 @@ def recall(
     embedder: Embedder,
     config: RecallConfig,
     request: RecallRequest,
-    now: int | None = None,
+    now: str | None = None,
 ) -> list[RecallHit]:
     """Run the recall pipeline. Returns a ranked list of hits."""
-    now = int(now if now is not None else time.time())
+    now = now if now is not None else now_iso()
     t0 = time.monotonic()
 
     # 1. Embed the query.
@@ -149,7 +150,7 @@ def recall(
         note = notes_by_id.get(note_id)
         if note is None:
             continue
-        age = max(0, now - note.ingested_at)
+        age = max(0, (iso_to_dt(now) - iso_to_dt(note.ingested_at)).total_seconds())
         boost = math.exp(-age / half_life_seconds)
         boosted.append((note_id, base_score * boost))
     boosted.sort(key=lambda pair: pair[1], reverse=True)

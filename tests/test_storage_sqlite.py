@@ -6,13 +6,13 @@ installed at the system level — pytest will skip them if not available.
 """
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import pytest
 
 from ai_memory.core.models import Episode, Note, Profile
 from ai_memory.storage.sqlite_store import SqliteStore
+from ai_memory.timestamps import now_iso
 
 
 pytest.importorskip("sqlite_vec")
@@ -27,7 +27,7 @@ def store(tmp_path: Path) -> SqliteStore:
 
 
 def test_profile_roundtrip(store: SqliteStore) -> None:
-    profile = Profile(key="name", value="Igor", updated_at=int(time.time()), source="manual")
+    profile = Profile(key="name", value="Igor", updated_at=now_iso(), source="manual")
     store.upsert_profile(profile)
     listed = store.list_profile()
     assert len(listed) == 1
@@ -35,7 +35,7 @@ def test_profile_roundtrip(store: SqliteStore) -> None:
 
 
 def test_note_roundtrip_and_invalidation(store: SqliteStore) -> None:
-    now = int(time.time())
+    now = now_iso()
     note = Note(
         id="01HX1",
         text="Igor prefers PostgreSQL",
@@ -51,13 +51,14 @@ def test_note_roundtrip_and_invalidation(store: SqliteStore) -> None:
     assert fetched.tags == ["preference", "db"]
     assert fetched.valid_to is None
 
-    store.invalidate_note("01HX1", when=now + 100, superseded_by=None)
+    later = "2099-01-01T00:00:00Z"
+    store.invalidate_note("01HX1", when=later, superseded_by=None)
     fetched = store.get_note("01HX1")
-    assert fetched is not None and fetched.valid_to == now + 100
+    assert fetched is not None and fetched.valid_to == later
 
 
 def test_episode_and_turn_roundtrip(store: SqliteStore) -> None:
-    now = int(time.time())
+    now = now_iso()
     episode = Episode(
         id="01HE1", title="t", summary="s", source="manual",
         started_at=now, raw_file="2026/04/01HE1.jsonl", embedding_model="test",
@@ -72,7 +73,7 @@ def test_episode_and_turn_roundtrip(store: SqliteStore) -> None:
 
 def test_vector_search(store: SqliteStore) -> None:
     """Verify sqlite-vec returns nearest neighbours in expected order."""
-    now = int(time.time())
+    now = now_iso()
     notes = [
         ("a", [1.0, 0.0, 0.0, 0.0]),
         ("b", [0.9, 0.1, 0.0, 0.0]),
@@ -88,7 +89,7 @@ def test_vector_search(store: SqliteStore) -> None:
 
 
 def test_bm25_search(store: SqliteStore) -> None:
-    now = int(time.time())
+    now = now_iso()
     for nid, text in [("a", "Postgres relational"), ("b", "DynamoDB key value"), ("c", "Postgres JSON columns")]:
         store.insert_note(
             Note(id=nid, text=text, valid_from=now, ingested_at=now, embedding_model="t"),

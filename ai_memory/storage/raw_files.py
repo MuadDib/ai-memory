@@ -19,7 +19,6 @@ Why JSONL on disk instead of putting raw text in SQLite?
 from __future__ import annotations
 
 import json
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
@@ -49,7 +48,7 @@ class RawTranscriptStore:
     # --- Writes ----------------------------------------------------------
 
     def append_turn(
-        self, episode_id: str, started_at: int, payload: dict
+        self, episode_id: str, started_at: str, payload: dict
     ) -> TurnAppendResult:
         """Append one JSONL line to the episode's raw file. Returns offset/length."""
         rel_path = self._relative_path_for(episode_id, started_at)
@@ -86,7 +85,7 @@ class RawTranscriptStore:
         with full_path.open("r", encoding="utf-8") as fh:
             return [json.loads(line) for line in fh if line.strip()]
 
-    def open_for_streaming_writes(self, episode_id: str, started_at: int) -> "_TurnWriter":
+    def open_for_streaming_writes(self, episode_id: str, started_at: str) -> "_TurnWriter":
         """Open a streaming writer for an episode — use when ingesting many turns at once.
 
         The writer keeps the file handle open across calls (one fewer fsync per turn)
@@ -100,9 +99,10 @@ class RawTranscriptStore:
     # --- Helpers ---------------------------------------------------------
 
     @staticmethod
-    def _relative_path_for(episode_id: str, started_at: int) -> Path:
-        ts = time.gmtime(started_at)
-        return Path(f"{ts.tm_year:04d}") / f"{ts.tm_mon:02d}" / f"{episode_id}.jsonl"
+    def _relative_path_for(episode_id: str, started_at: str) -> Path:
+        # started_at is ISO 8601 UTC e.g. '2026-04-29T18:35:23Z' — take YYYY/MM directly.
+        year, month = started_at[:4], started_at[5:7]
+        return Path(year) / month / f"{episode_id}.jsonl"
 
 
 class _TurnWriter:

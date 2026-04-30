@@ -33,12 +33,12 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 from ai_memory.core.models import CoworkImportState, Episode, Turn
+from ai_memory.timestamps import now_iso, unix_to_iso
 
 logger = logging.getLogger(__name__)
 
@@ -279,7 +279,7 @@ def _import_one_session(
             session_id=session_id,
             last_turn_id=final_turn_id,
             last_byte_offset=final_offset,
-            last_imported_at=int(time.time()),
+            last_imported_at=now_iso(),
         )
     )
 
@@ -348,7 +348,7 @@ def _coerce_turn(obj: dict, *, include_tools: bool, jsonl_stem: str) -> dict | N
         import hashlib
         turn_id = f"{jsonl_stem}-{hashlib.sha1(text.encode('utf-8')).hexdigest()[:12]}"
 
-    ts = _parse_timestamp(obj.get("timestamp")) or int(time.time())
+    ts = _parse_timestamp(obj.get("timestamp")) or now_iso()
 
     return {
         "id": str(turn_id),
@@ -396,16 +396,21 @@ def _flatten_blocks(blocks: list, *, include_tools: bool) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
-def _parse_timestamp(value) -> int | None:
-    """Claude Code sometimes emits ISO 8601, sometimes epoch seconds."""
+def _parse_timestamp(value) -> str | None:
+    """Claude Code sometimes emits ISO 8601, sometimes epoch seconds.
+
+    Always returns an ISO 8601 UTC string (e.g. '2026-04-29T18:35:23Z') or None.
+    """
     if value is None:
         return None
     if isinstance(value, (int, float)):
-        return int(value)
+        return unix_to_iso(value)
     if isinstance(value, str):
         try:
             from datetime import datetime
-            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+            # Normalise to our standard format (strips sub-second precision etc.)
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         except ValueError:
             return None
     return None

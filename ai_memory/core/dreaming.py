@@ -27,7 +27,6 @@ import json
 import logging
 import math
 import re
-import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterable, List, Tuple
 
@@ -38,6 +37,7 @@ from ai_memory.core.models import DreamLog, Note, Profile
 from ai_memory.embeddings.interface import Embedder
 from ai_memory.llm.interface import Llm, Message
 from ai_memory.storage.raw_files import RawTranscriptStore
+from ai_memory.timestamps import iso_to_dt, now_iso
 
 if TYPE_CHECKING:
     from ai_memory.storage.interface import MemoryStore
@@ -79,7 +79,7 @@ EXTRACT_CHUNK_OVERLAP = 5
 @dataclass(frozen=True)
 class DreamRequest:
     trigger: str = "manual"  # 'scheduled' | 'idle' | 'pressure' | 'manual'
-    since: int | None = None  # default: time of last completed dream
+    since: str | None = None  # ISO 8601 UTC; default: time of last completed dream
 
 
 @dataclass
@@ -190,13 +190,13 @@ def dream(
     llm: Llm,
     config: DreamConfig,
     request: DreamRequest,
-    now: int | None = None,
+    now: str | None = None,
 ) -> DreamReport:
     """Run a single dream pass. Inserts a DreamLog row and returns a report."""
-    now = int(now if now is not None else time.time())
+    now = now if now is not None else now_iso()
     log_id = str(ULID())
 
-    log = DreamLog(id=log_id, started_at=now, trigger=request.trigger)  # type: ignore[arg-type]
+    log = DreamLog(id=log_id, started_at=now, trigger=request.trigger)
     store.insert_dream_log(log)
 
     # Fetch *all* unconsolidated episodes regardless of when they started.
@@ -214,7 +214,7 @@ def dream(
     if request.since is not None:
         candidate_episodes = store.episodes_since(request.since)
     else:
-        candidate_episodes = store.episodes_since(0)
+        candidate_episodes = store.episodes_since("1970-01-01T00:00:00Z")
     episodes = [ep for ep in candidate_episodes if ep.consolidated_at is None]
     journal.append(
         f"Phase 1+2: {len(episodes)} unconsolidated episodes (scanned "
@@ -359,7 +359,7 @@ def dream(
 
     # --- Phase 7: journal ----------------------------------------------
     journal.append(f"LLM tokens used this pass: {tokens_used} ({llm.model_id})")
-    log.ended_at = int(time.time())
+    log.ended_at = now_iso()
     log.episodes_processed = len(episodes)
     log.notes_added = notes_added
     log.notes_invalidated = notes_invalidated
@@ -389,7 +389,7 @@ def _phase4_integrate(
     store: "MemoryStore",
     embedder: Embedder,
     llm: Llm,
-    now: int,
+    now: str,
     journal: List[str],
 ) -> Tuple[dict, int]:
     """Integrate candidate facts: dedup, contradict-resolve, insert.
@@ -488,7 +488,7 @@ def _insert_candidate(
     cand: _CandidateFact,
     embedding: List[float],
     embedder: Embedder,
-    now: int,
+    now: str,
     contradicts: List[str] | None = None,
 ) -> str:
     """Persist a candidate as a new Tier 1 note. Returns the new note id."""
@@ -514,7 +514,7 @@ def _phase5_promote(
     store: "MemoryStore",
     llm: Llm,
     config: DreamConfig,
-    now: int,
+    now: str,
     journal: List[str],
 ) -> Tuple[int, int]:
     """Find recurring fact clusters and promote them to Tier 0 profile.
@@ -644,21 +644,22 @@ def _sanitise_profile_key(key: str) -> str:
 
 
 def _phase6_prune(
-    *, store: "MemoryStore", config: DreamConfig, now: int, journal: List[str]
+    *, store: "MemoryStore", config: DreamConfig, now: str, journal: List[str]
 ) -> int:
     """Soft-delete stale, never-recalled, never-promoted notes."""
     half_life = max(1, config.decay_half_life_days) * 86400
     pruned = 0
+    now_dt = iso_to_dt(now)
 
     valid_notes = store.list_valid_notes()
     for note in valid_notes:
         if note.promoted_to_profile:
             continue  # never prune promoted facts
-        age_seconds = max(0, now - note.ingested_at)
+        age_seconds = max(0, (now_dt - iso_to_dt(note.ingested_at)).total_seconds())
         if age_seconds < PRUNE_MIN_AGE_DAYS * 86400:
             continue  # too young to prune
         last_access = note.last_accessed_at or note.ingested_at
-        if (now - last_access) < PRUNE_RECENT_RECALL_DAYS * 86400 and note.access_count > 0:
+        if (now_dt - iso_to_dt(last_access)).total_seconds() < PRUNE_RECENT_RECALL_DAYS * 86400 and note.access_count > 0:
             continue  # recently used
 
         decay = math.exp(-age_seconds / half_life)

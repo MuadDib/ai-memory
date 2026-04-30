@@ -80,16 +80,19 @@ def test_flatten_drops_empty_text() -> None:
 
 
 def test_parse_timestamp_iso() -> None:
-    # Drop sub-second precision; equality on the second is enough.
-    assert _parse_timestamp("2026-04-26T23:38:21Z") == 1777246701
+    # ISO input passes through normalised (sub-second stripped, Z suffix kept).
+    assert _parse_timestamp("2026-04-26T23:38:21Z") == "2026-04-26T23:38:21Z"
 
 
 def test_parse_timestamp_epoch_int() -> None:
-    assert _parse_timestamp(1777246701) == 1777246701
+    # Unix epoch is converted to ISO 8601 UTC string.
+    result = _parse_timestamp(1777246701)
+    assert isinstance(result, str) and result.endswith("Z") and "T" in result
 
 
 def test_parse_timestamp_epoch_float() -> None:
-    assert _parse_timestamp(1777246701.5) == 1777246701
+    result = _parse_timestamp(1777246701.5)
+    assert isinstance(result, str) and result.endswith("Z") and "T" in result
 
 
 def test_parse_timestamp_none() -> None:

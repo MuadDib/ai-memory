@@ -11,14 +11,15 @@ clusters turns into proper episodes overnight (Phase 2 of the cycle).
 """
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
+from datetime import timezone
 
 from ulid import ULID
 
 from ai_memory.core.models import Episode, Turn
 from ai_memory.privacy import redact
 from ai_memory.storage.raw_files import RawTranscriptStore
+from ai_memory.timestamps import iso_to_dt, now_iso
 
 # Anything from `MemoryStore` we use as a structural type to avoid a circular
 # import — the recall pipeline imports models too.
@@ -50,14 +51,14 @@ def remember(
     source: str,
     role: str = "user",
     episode_id: str | None = None,
-    now: int | None = None,
+    now: str | None = None,
 ) -> RememberResult:
     """Append one turn. Open a new episode if needed.
 
     Always runs the privacy redactor first; the un-redacted text is never
     persisted (anywhere — neither raw file nor index).
     """
-    now = int(now if now is not None else time.time())
+    now = now if now is not None else now_iso()
     redaction = redact(text)
     safe_text = redaction.text
 
@@ -91,15 +92,17 @@ def remember(
     )
 
 
-def _find_or_open_episode(store: "MemoryStore", source: str, now: int) -> str:
+def _find_or_open_episode(store: "MemoryStore", source: str, now: str) -> str:
     """Return id of a recent unconsolidated episode for `source`, or create one."""
+    now_dt = iso_to_dt(now)
     recent = store.list_recent_episodes(limit=10)
     for ep in recent:
         if ep.source != source:
             continue
         if ep.consolidated_at is not None:
             continue
-        if now - ep.started_at > _EPISODE_MAX_AGE_SECONDS:
+        age = (now_dt - iso_to_dt(ep.started_at)).total_seconds()
+        if age > _EPISODE_MAX_AGE_SECONDS:
             continue
         return ep.id
 

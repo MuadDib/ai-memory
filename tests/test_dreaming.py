@@ -6,8 +6,6 @@ phases themselves are covered by end-to-end tests once they exist.
 """
 from __future__ import annotations
 
-import time
-
 from ai_memory.core.dreaming import (
     _cluster_notes,
     _euclid_distance,
@@ -17,6 +15,7 @@ from ai_memory.core.dreaming import (
     _sanitise_profile_key,
 )
 from ai_memory.core.models import Note
+from ai_memory.timestamps import now_iso
 
 
 # --- Distance --------------------------------------------------------------
@@ -38,8 +37,8 @@ def _note(id_: str, episode: str = "e1") -> Note:
     return Note(
         id=id_,
         text=f"text-{id_}",
-        valid_from=int(time.time()),
-        ingested_at=int(time.time()),
+        valid_from=now_iso(),
+        ingested_at=now_iso(),
         embedding_model="test",
         source_episode_ids=[episode],
     )

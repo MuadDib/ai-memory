@@ -23,7 +23,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,6 +30,7 @@ from ulid import ULID
 
 from ai_memory.core.models import Episode, Note, Profile, Turn
 from ai_memory.core.service import MemoryService
+from ai_memory.timestamps import now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ def bootstrap_from_markdown(
     `source` should be one of `chatgpt-export` / `claude-export` / `manual`.
     """
     text = file_path.read_text(encoding="utf-8")
-    now = int(time.time())
+    now = now_iso()
 
     # Save a copy to exports/ for verbatim retrieval.
     exports_copy = service.config.exports_dir / file_path.name

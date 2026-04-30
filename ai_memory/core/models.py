@@ -5,9 +5,9 @@ Deliberately not using ORM models — these are the canonical shape of data
 flowing through the system. Storage adapters translate to/from these. A
 future C# port maps each one to a record/POCO class with the same fields.
 
-All timestamps are Unix epoch seconds (int) for portability and ease of
-arithmetic. Display formatting is a presentation concern, not a model
-concern.
+All timestamps are ISO 8601 UTC strings (e.g. '2026-04-29T18:35:23Z').
+Lexicographically sortable, human-readable, and unambiguous.
+Use ai_memory.timestamps for conversion helpers.
 """
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ class Profile:
 
     key: str
     value: str
-    updated_at: int
+    updated_at: str  # ISO 8601 UTC e.g. '2026-04-29T18:35:23Z'
     source: str | None = None
 
 
@@ -60,15 +60,15 @@ class Note:
     text: str
     tags: list[str] = field(default_factory=list)
     source_episode_ids: list[str] = field(default_factory=list)
-    valid_from: int = 0
-    valid_to: int | None = None
-    ingested_at: int = 0
+    valid_from: str = ""   # ISO 8601 UTC
+    valid_to: str | None = None
+    ingested_at: str = ""  # ISO 8601 UTC
     superseded_by: str | None = None
     contradicts: list[str] = field(default_factory=list)
     promoted_to_profile: bool = False
     embedding_model: str = ""
     access_count: int = 0
-    last_accessed_at: int | None = None
+    last_accessed_at: str | None = None  # ISO 8601 UTC
 
 
 @dataclass
@@ -79,11 +79,11 @@ class Episode:
     title: str
     summary: str
     source: str  # which AI client; see KnownSource
-    started_at: int
-    ended_at: int | None = None
+    started_at: str   # ISO 8601 UTC
+    ended_at: str | None = None
     raw_file: str = ""  # relative path within the raw/ tree
     embedding_model: str = ""
-    consolidated_at: int | None = None  # null = not yet dreamed
+    consolidated_at: str | None = None  # None = not yet dreamed
 
 
 @dataclass
@@ -96,7 +96,7 @@ class Turn:
     byte_offset: int
     byte_length: int
     role: Role
-    ts: int
+    ts: str  # ISO 8601 UTC
 
 
 @dataclass
@@ -108,8 +108,8 @@ class DreamLog:
     """
 
     id: str
-    started_at: int
-    ended_at: int | None = None
+    started_at: str   # ISO 8601 UTC
+    ended_at: str | None = None
     trigger: Literal["scheduled", "idle", "pressure", "manual"] = "manual"
     episodes_processed: int = 0
     notes_added: int = 0
@@ -135,7 +135,7 @@ class CoworkImportState:
     session_id: str
     last_turn_id: str
     last_byte_offset: int
-    last_imported_at: int
+    last_imported_at: str  # ISO 8601 UTC
 
 
 @dataclass

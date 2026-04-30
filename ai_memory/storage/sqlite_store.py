@@ -24,14 +24,14 @@ from ai_memory.core.models import CoworkImportState, DreamLog, Episode, Note, Pr
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
-  version INTEGER PRIMARY KEY,
-  applied_at INTEGER NOT NULL
+  version    INTEGER PRIMARY KEY,
+  applied_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS profile (
   key        TEXT PRIMARY KEY,
   value      TEXT NOT NULL,
-  updated_at INTEGER NOT NULL,
+  updated_at TEXT NOT NULL,
   source     TEXT
 );
 
@@ -40,15 +40,15 @@ CREATE TABLE IF NOT EXISTS notes (
   text                  TEXT NOT NULL,
   tags                  TEXT,                         -- JSON array
   source_episode_ids    TEXT,                         -- JSON array
-  valid_from            INTEGER NOT NULL,
-  valid_to              INTEGER,
-  ingested_at           INTEGER NOT NULL,
+  valid_from            TEXT NOT NULL,
+  valid_to              TEXT,
+  ingested_at           TEXT NOT NULL,
   superseded_by         TEXT REFERENCES notes(id),
   contradicts           TEXT,                         -- JSON array
   promoted_to_profile   INTEGER NOT NULL DEFAULT 0,
   embedding_model       TEXT NOT NULL,
   access_count          INTEGER NOT NULL DEFAULT 0,
-  last_accessed_at      INTEGER
+  last_accessed_at      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS notes_valid_to     ON notes(valid_to);
@@ -66,11 +66,11 @@ CREATE TABLE IF NOT EXISTS episodes (
   title             TEXT,
   summary           TEXT NOT NULL,
   source            TEXT NOT NULL,
-  started_at        INTEGER NOT NULL,
-  ended_at          INTEGER,
+  started_at        TEXT NOT NULL,
+  ended_at          TEXT,
   raw_file          TEXT NOT NULL,
   embedding_model   TEXT NOT NULL,
-  consolidated_at   INTEGER
+  consolidated_at   TEXT
 );
 
 CREATE INDEX IF NOT EXISTS episodes_started_at ON episodes(started_at);
@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS turns (
   byte_offset INTEGER NOT NULL,
   byte_length INTEGER NOT NULL,
   role        TEXT NOT NULL,
-  ts          INTEGER NOT NULL
+  ts          TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS turns_by_episode ON turns(episode_id, ts);
@@ -91,8 +91,8 @@ CREATE INDEX IF NOT EXISTS turns_ts         ON turns(ts);
 
 CREATE TABLE IF NOT EXISTS dream_log (
   id                          TEXT PRIMARY KEY,
-  started_at                  INTEGER NOT NULL,
-  ended_at                    INTEGER,
+  started_at                  TEXT NOT NULL,
+  ended_at                    TEXT,
   trigger                     TEXT NOT NULL,
   episodes_processed          INTEGER NOT NULL DEFAULT 0,
   notes_added                 INTEGER NOT NULL DEFAULT 0,
@@ -108,11 +108,60 @@ CREATE TABLE IF NOT EXISTS cowork_import_state (
   session_id        TEXT PRIMARY KEY,
   last_turn_id      TEXT NOT NULL,
   last_byte_offset  INTEGER NOT NULL,
-  last_imported_at  INTEGER NOT NULL
+  last_imported_at  TEXT NOT NULL
 );
 """
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# Migration SQL run once when upgrading from schema version 1 (Unix int
+# timestamps) to version 2 (ISO 8601 UTC strings).  The WHERE guards make
+# each statement idempotent — rows already containing 'T' are skipped.
+_MIGRATION_V1_TO_V2 = """
+UPDATE schema_version
+   SET applied_at = datetime(CAST(applied_at AS INTEGER), 'unixepoch') || 'Z'
+ WHERE applied_at NOT LIKE '%T%';
+
+UPDATE profile
+   SET updated_at = datetime(CAST(updated_at AS INTEGER), 'unixepoch') || 'Z'
+ WHERE updated_at NOT LIKE '%T%';
+
+UPDATE notes
+   SET valid_from       = datetime(CAST(valid_from AS INTEGER), 'unixepoch') || 'Z',
+       ingested_at      = datetime(CAST(ingested_at AS INTEGER), 'unixepoch') || 'Z',
+       valid_to         = CASE WHEN valid_to IS NOT NULL AND valid_to NOT LIKE '%T%'
+                               THEN datetime(CAST(valid_to AS INTEGER), 'unixepoch') || 'Z'
+                               ELSE valid_to END,
+       last_accessed_at = CASE WHEN last_accessed_at IS NOT NULL AND last_accessed_at NOT LIKE '%T%'
+                               THEN datetime(CAST(last_accessed_at AS INTEGER), 'unixepoch') || 'Z'
+                               ELSE last_accessed_at END
+ WHERE valid_from NOT LIKE '%T%';
+
+UPDATE episodes
+   SET started_at     = datetime(CAST(started_at AS INTEGER), 'unixepoch') || 'Z',
+       ended_at       = CASE WHEN ended_at IS NOT NULL AND ended_at NOT LIKE '%T%'
+                             THEN datetime(CAST(ended_at AS INTEGER), 'unixepoch') || 'Z'
+                             ELSE ended_at END,
+       consolidated_at = CASE WHEN consolidated_at IS NOT NULL AND consolidated_at NOT LIKE '%T%'
+                              THEN datetime(CAST(consolidated_at AS INTEGER), 'unixepoch') || 'Z'
+                              ELSE consolidated_at END
+ WHERE started_at NOT LIKE '%T%';
+
+UPDATE turns
+   SET ts = datetime(CAST(ts AS INTEGER), 'unixepoch') || 'Z'
+ WHERE ts NOT LIKE '%T%';
+
+UPDATE dream_log
+   SET started_at = datetime(CAST(started_at AS INTEGER), 'unixepoch') || 'Z',
+       ended_at   = CASE WHEN ended_at IS NOT NULL AND ended_at NOT LIKE '%T%'
+                         THEN datetime(CAST(ended_at AS INTEGER), 'unixepoch') || 'Z'
+                         ELSE ended_at END
+ WHERE started_at NOT LIKE '%T%';
+
+UPDATE cowork_import_state
+   SET last_imported_at = datetime(CAST(last_imported_at AS INTEGER), 'unixepoch') || 'Z'
+ WHERE last_imported_at NOT LIKE '%T%';
+"""
 
 
 def _fts5_escape(query: str) -> str:
@@ -178,9 +227,18 @@ class SqliteStore:
             f"CREATE VIRTUAL TABLE IF NOT EXISTS episodes_vec "
             f"USING vec0(episode_id TEXT PRIMARY KEY, embedding float[{self._embedding_dim}])"
         )
+        # Run v1→v2 migration if the DB is on the old Unix-int timestamp schema.
+        current = conn.execute(
+            "SELECT MAX(version) AS v FROM schema_version"
+        ).fetchone()
+        current_version = current["v"] if current and current["v"] is not None else 0
+        if current_version < 2:
+            conn.executescript(_MIGRATION_V1_TO_V2)
+
         # Record schema version (idempotent insert)
         conn.execute(
-            "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (?, strftime('%s','now'))",
+            "INSERT OR IGNORE INTO schema_version(version, applied_at)"
+            " VALUES (?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
             (SCHEMA_VERSION,),
         )
         conn.commit()
@@ -325,7 +383,7 @@ class SqliteStore:
             ).fetchall()
         return [(_row_to_note(r), float(r["rank"])) for r in rows]
 
-    def invalidate_note(self, note_id: str, when: int, superseded_by: str | None) -> None:
+    def invalidate_note(self, note_id: str, when: str, superseded_by: str | None) -> None:
         with self._lock:
             self.conn.execute(
                 "UPDATE notes SET valid_to = ?, superseded_by = ? WHERE id = ?",
@@ -333,7 +391,7 @@ class SqliteStore:
             )
             self.conn.commit()
 
-    def bump_note_access(self, note_id: str, when: int) -> None:
+    def bump_note_access(self, note_id: str, when: str) -> None:
         """Bump access_count + last_accessed_at when a note is reused (e.g. dedup hit)."""
         with self._lock:
             self.conn.execute(
@@ -449,14 +507,14 @@ class SqliteStore:
             ).fetchall()
         return [(_row_to_episode(r), float(r["distance"])) for r in rows]
 
-    def episodes_since(self, ts: int) -> list[Episode]:
+    def episodes_since(self, ts: str) -> list[Episode]:
         with self._lock:
             rows = self.conn.execute(
                 "SELECT * FROM episodes WHERE started_at >= ? ORDER BY started_at", (ts,)
             ).fetchall()
         return [_row_to_episode(r) for r in rows]
 
-    def mark_episode_consolidated(self, episode_id: str, when: int) -> None:
+    def mark_episode_consolidated(self, episode_id: str, when: str) -> None:
         with self._lock:
             self.conn.execute(
                 "UPDATE episodes SET consolidated_at = ? WHERE id = ?", (when, episode_id)
@@ -483,7 +541,7 @@ class SqliteStore:
             ).fetchall()
         return [_row_to_turn(r) for r in rows]
 
-    def count_turns_since(self, ts: int) -> int:
+    def count_turns_since(self, ts: str) -> int:
         with self._lock:
             row = self.conn.execute("SELECT COUNT(*) AS n FROM turns WHERE ts >= ?", (ts,)).fetchone()
         return int(row["n"]) if row else 0
@@ -537,12 +595,12 @@ class SqliteStore:
             ).fetchall()
         return [_row_to_dream_log(r) for r in rows]
 
-    def last_dream_completed_at(self) -> int | None:
+    def last_dream_completed_at(self) -> str | None:
         with self._lock:
             row = self.conn.execute(
                 "SELECT MAX(ended_at) AS last FROM dream_log WHERE ended_at IS NOT NULL"
             ).fetchone()
-        return int(row["last"]) if row and row["last"] is not None else None
+        return str(row["last"]) if row and row["last"] is not None else None
 
     # --- Cowork importer state ------------------------------------------
 
@@ -557,7 +615,7 @@ class SqliteStore:
             session_id=row["session_id"],
             last_turn_id=row["last_turn_id"],
             last_byte_offset=int(row["last_byte_offset"]),
-            last_imported_at=int(row["last_imported_at"]),
+            last_imported_at=str(row["last_imported_at"]),
         )
 
     def upsert_cowork_import_state(self, state: CoworkImportState) -> None:
@@ -594,7 +652,7 @@ def _row_to_profile(row: sqlite3.Row) -> Profile:
     return Profile(
         key=row["key"],
         value=row["value"],
-        updated_at=int(row["updated_at"]),
+        updated_at=str(row["updated_at"]),
         source=row["source"],
     )
 
@@ -623,15 +681,15 @@ def _row_to_note(row: sqlite3.Row) -> Note:
         text=row["text"],
         tags=_json_or_default(row["tags"], []),
         source_episode_ids=_json_or_default(row["source_episode_ids"], []),
-        valid_from=int(row["valid_from"]),
-        valid_to=int(row["valid_to"]) if row["valid_to"] is not None else None,
-        ingested_at=int(row["ingested_at"]),
+        valid_from=str(row["valid_from"]),
+        valid_to=str(row["valid_to"]) if row["valid_to"] is not None else None,
+        ingested_at=str(row["ingested_at"]),
         superseded_by=row["superseded_by"],
         contradicts=_json_or_default(row["contradicts"], []),
         promoted_to_profile=bool(row["promoted_to_profile"]),
         embedding_model=row["embedding_model"],
         access_count=int(row["access_count"]),
-        last_accessed_at=int(row["last_accessed_at"]) if row["last_accessed_at"] is not None else None,
+        last_accessed_at=str(row["last_accessed_at"]) if row["last_accessed_at"] is not None else None,
     )
 
 
@@ -641,11 +699,11 @@ def _row_to_episode(row: sqlite3.Row) -> Episode:
         title=row["title"] or "",
         summary=row["summary"],
         source=row["source"],
-        started_at=int(row["started_at"]),
-        ended_at=int(row["ended_at"]) if row["ended_at"] is not None else None,
+        started_at=str(row["started_at"]),
+        ended_at=str(row["ended_at"]) if row["ended_at"] is not None else None,
         raw_file=row["raw_file"],
         embedding_model=row["embedding_model"],
-        consolidated_at=int(row["consolidated_at"]) if row["consolidated_at"] is not None else None,
+        consolidated_at=str(row["consolidated_at"]) if row["consolidated_at"] is not None else None,
     )
 
 
@@ -657,15 +715,15 @@ def _row_to_turn(row: sqlite3.Row) -> Turn:
         byte_offset=int(row["byte_offset"]),
         byte_length=int(row["byte_length"]),
         role=row["role"],
-        ts=int(row["ts"]),
+        ts=str(row["ts"]),
     )
 
 
 def _row_to_dream_log(row: sqlite3.Row) -> DreamLog:
     return DreamLog(
         id=row["id"],
-        started_at=int(row["started_at"]),
-        ended_at=int(row["ended_at"]) if row["ended_at"] is not None else None,
+        started_at=str(row["started_at"]),
+        ended_at=str(row["ended_at"]) if row["ended_at"] is not None else None,
         trigger=row["trigger"],
         episodes_processed=int(row["episodes_processed"]),
         notes_added=int(row["notes_added"]),

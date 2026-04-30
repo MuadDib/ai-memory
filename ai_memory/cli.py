@@ -31,6 +31,7 @@ import click
 from ai_memory.bootstrap import bootstrap_from_markdown
 from ai_memory.config import ensure_home_layout, load_config
 from ai_memory.core.service import MemoryService
+from ai_memory.timestamps import iso_to_dt
 from ai_memory.transport.mcp_server import serve_mcp
 
 
@@ -151,7 +152,6 @@ def profile(config):
 @click.pass_obj
 def recent_episodes(config, limit):
     """List the most recent episodes by start time."""
-    import datetime as _dt
     service = MemoryService.build(config)
     service.start()
     try:
@@ -160,7 +160,7 @@ def recent_episodes(config, limit):
             click.echo("(no episodes)")
             return
         for ep in episodes:
-            ts = _dt.datetime.fromtimestamp(ep.started_at).strftime("%Y-%m-%d %H:%M")
+            ts = iso_to_dt(ep.started_at).strftime("%Y-%m-%d %H:%M")
             consol = "C" if ep.consolidated_at else "."
             summary = (ep.summary or "").strip().replace("\n", " ")
             if len(summary) > 100:
@@ -175,7 +175,6 @@ def recent_episodes(config, limit):
 @click.pass_obj
 def dream_log(config, limit):
     """Show recent dream-cycle passes."""
-    import datetime as _dt
     service = MemoryService.build(config)
     service.start()
     try:
@@ -184,7 +183,7 @@ def dream_log(config, limit):
             click.echo("(no dream passes recorded)")
             return
         for entry in logs:
-            ts = _dt.datetime.fromtimestamp(entry.started_at).strftime("%Y-%m-%d %H:%M")
+            ts = iso_to_dt(entry.started_at).strftime("%Y-%m-%d %H:%M")
             click.echo(
                 f"{ts}  trigger={entry.trigger:10s}  "
                 f"episodes={entry.episodes_processed}  "
