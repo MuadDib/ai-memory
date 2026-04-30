@@ -46,6 +46,7 @@ class MemoryService:
     raw: RawTranscriptStore
     embedder: Embedder
     llm: Llm
+    quality_llm: "Llm | None" = None
 
     # --- Lifecycle -------------------------------------------------------
 
@@ -75,9 +76,21 @@ class MemoryService:
                 f"LLM provider '{config.llm.provider}' not yet supported in v0.1"
             )
 
+        # Optional quality-model LLM for long episodes (Phase 3 extract/summary).
+        quality_llm: Llm | None = None
+        if config.llm.quality_model:
+            if config.llm.provider == "anthropic":
+                quality_llm = AnthropicLlm(model=config.llm.quality_model)
+            elif config.llm.provider == "openai":
+                from ai_memory.llm.openai_llm import OpenAILlm
+                quality_llm = OpenAILlm(model=config.llm.quality_model)
+
         store = SqliteStore(config.database_path, embedding_dim=embedder.dimensions)
         raw = RawTranscriptStore(config.raw_dir)
-        return cls(config=config, store=store, raw=raw, embedder=embedder, llm=llm)
+        return cls(
+            config=config, store=store, raw=raw, embedder=embedder,
+            llm=llm, quality_llm=quality_llm,
+        )
 
     def start(self) -> None:
         self.store.initialise()
@@ -127,6 +140,7 @@ class MemoryService:
             raw=self.raw,
             embedder=self.embedder,
             llm=self.llm,
+            quality_llm=self.quality_llm,
             config=self.config.dream,
             request=_dreaming.DreamRequest(trigger=trigger, since=since),
         )

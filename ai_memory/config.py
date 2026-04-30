@@ -41,6 +41,11 @@ class LlmConfig:
     provider: Literal["anthropic", "openai"] = "anthropic"
     model: str = "claude-sonnet-4-6"
     max_tokens: int = 4096
+    # Optional upgrade model for long/dense episodes.  When set, episodes with
+    # >= dream.long_episode_turns turns use this model for Phase 3 (extract +
+    # summary), where extraction quality matters most.  Leave empty to always
+    # use `model`.  Example: "gpt-4o" when base is "gpt-4o-mini".
+    quality_model: str = ""
 
 
 @dataclass(frozen=True)
@@ -54,6 +59,9 @@ class DreamConfig:
     promotion_min_episodes: int = 2
     decay_half_life_days: int = 90
     prune_threshold: float = 0.05
+    # Turn count at or above which the quality_model is used for Phase 3
+    # extraction on that episode.  0 = never upgrade.
+    long_episode_turns: int = 100
 
 
 @dataclass(frozen=True)

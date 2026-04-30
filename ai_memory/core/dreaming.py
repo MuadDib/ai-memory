@@ -288,11 +288,17 @@ def dream(
     raw: RawTranscriptStore,
     embedder: Embedder,
     llm: Llm,
+    quality_llm: "Llm | None" = None,
     config: DreamConfig,
     request: DreamRequest,
     now: str | None = None,
 ) -> DreamReport:
-    """Run a single dream pass. Inserts a DreamLog row and returns a report."""
+    """Run a single dream pass. Inserts a DreamLog row and returns a report.
+
+    `quality_llm`: when set, episodes with >= `config.long_episode_turns` turns
+    use this LLM for Phase 3 (summary + extract) where extraction quality
+    matters most.  Phase 4 and Phase 5 always use the base `llm`.
+    """
     now = now if now is not None else now_iso()
     log_id = str(uuid4())
 
@@ -334,6 +340,20 @@ def dream(
             continue
         transcript = _render_transcript(raw, turns)
 
+        # Select model: upgrade to quality_llm for long/dense episodes where
+        # better extraction quality is worth the extra cost.
+        long_threshold = config.long_episode_turns if config.long_episode_turns > 0 else 10**9
+        ep_llm = (
+            quality_llm
+            if quality_llm is not None and len(turns) >= long_threshold
+            else llm
+        )
+        if ep_llm is not llm:
+            journal.append(
+                f"  Episode {ep.id}: {len(turns)} turns >= {long_threshold} — "
+                f"using quality model ({ep_llm.model_id}) for Phase 3."
+            )
+
         # Summary: single-shot on the whole transcript. Synthesising one
         # paragraph is well within gpt-4o-mini's effective range even at
         # 60k+ tokens; only enumerative tasks (extract) need chunking.
@@ -342,7 +362,7 @@ def dream(
             "The conversation has already concluded — do not continue it.\n\n"
             + transcript
         )
-        summary_completion = llm.complete(
+        summary_completion = ep_llm.complete(
             system=SUMMARY_SYSTEM,
             messages=[Message(role="user", content=summary_user_msg)],
             max_tokens=1200,
@@ -364,7 +384,7 @@ def dream(
                 + chunk_transcript
             )
             chunk_facts, chunk_tokens = _llm_call_with_retry(
-                llm=llm,
+                llm=ep_llm,
                 system=extract_system,
                 user_msg=extract_user_msg,
                 parse_fn=_parse_extract_facts,
