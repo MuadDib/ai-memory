@@ -145,43 +145,69 @@ def bootstrap_from_markdown(
 
 # --- Markdown helpers -------------------------------------------------------
 
-_BULLET_LINE = re.compile(r"^\s*[-\*]\s+(.+?)\s*$")
+# Captures (leading_spaces, bullet_content)
+_BULLET_LINE = re.compile(r"^(\s*)[-\*]\s+(.+?)\s*$")
 _HEADING = re.compile(r"^#{1,6}\s+")
+_STRIP_BOLD = re.compile(r"\*+([^*]+)\*+")
 
 
-def _is_label_fragment(text: str) -> bool:
-    """Return True for bullet content that is a bare label, not a useful fact.
+def _clean(text: str) -> str:
+    """Strip markdown emphasis and surrounding whitespace."""
+    return _STRIP_BOLD.sub(r"\1", text).strip()
 
-    Filters two patterns that appear in chatgpt/claude memory exports:
-      - Category headers left as bullets: "Prefers:", "Uses:", "Stack:", ...
-      - Single bare terms with no context: "C#", "Angular", "Terraform", ...
-        (a lone word without spaces or colon adds nothing searchable)
+
+def _is_useless(text: str) -> bool:
+    """True for content that carries no standalone meaning.
+
+    After the nesting fix most fragments are gone, but we still catch:
+      - Bare single-word terms with no context (< 20 chars, no space, no colon)
     """
     t = text.strip()
-    if t.endswith(":"):
-        return True
-    # Single word (no whitespace), no key:value colon, too short to be a sentence
-    if " " not in t and ":" not in t and len(t) < 20:
-        return True
-    return False
+    return " " not in t and ":" not in t and len(t) < 20
 
 
 def _iter_bullets(text: str):
-    """Yield the trimmed text of each bullet line in a markdown document.
+    """Yield contextual fact strings from a structured markdown memory export.
 
-    We collapse markdown emphasis (`**bold**`, `*ital*`) for cleaner notes
-    but otherwise preserve the bullet content as-is.
-    Label-only fragments (e.g. "Prefers:", "Angular") are skipped.
+    Handles nested bullets by tracking the parent label:
+
+        - Prefers:              <- label at indent 0, saved as context
+          - Direct answers      <- emitted as "Prefers: Direct answers"
+        - Drinks tea            <- self-contained, emitted as-is
+
+    Section headings (##) reset the parent context but are not emitted.
+    Bold markers (**text**) are stripped.
     """
+    parent_label: str = ""   # text of the last label-bullet at indent 0
+
     for line in text.splitlines():
         if _HEADING.match(line):
+            parent_label = ""
             continue
-        if (m := _BULLET_LINE.match(line)):
-            content = m.group(1).strip()
-            content = re.sub(r"\*+([^*]+)\*+", r"\1", content)  # strip * and **
-            content = content.strip()
-            if content and not _is_label_fragment(content):
-                yield content
+
+        m = _BULLET_LINE.match(line)
+        if not m:
+            continue
+
+        indent = len(m.group(1))
+        content = _clean(m.group(2))
+        if not content:
+            continue
+
+        if indent == 0:
+            if content.endswith(":"):
+                # Sub-header label — save as context, don't emit
+                parent_label = content[:-1].strip()
+            else:
+                # Self-contained top-level fact
+                parent_label = ""
+                if not _is_useless(content):
+                    yield content
+        else:
+            # Nested child — prefix with parent label if we have one
+            fact = f"{parent_label}: {content}" if parent_label else content
+            if not _is_useless(fact):
+                yield fact
 
 
 def _first_paragraph(text: str) -> str:
