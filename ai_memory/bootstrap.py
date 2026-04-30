@@ -44,11 +44,19 @@ _PROFILE_KEY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 
+# Notes whose nearest existing neighbour is closer than this are skipped as
+# duplicates. Higher than Phase 4's DUPLICATE_DIST_BELOW (0.20) because
+# bootstrap facts are short and clean — "Name: Igor" vs "Name: Igor Valjevic"
+# sits at ~0.24 and is clearly the same fact.
+BOOTSTRAP_DEDUP_DIST = 0.30
+
+
 @dataclass
 class BootstrapResult:
     episode_id: str
     notes_inserted: int
     profile_updates: int
+    notes_skipped: int = 0
 
 
 def bootstrap_from_markdown(
@@ -98,6 +106,7 @@ def bootstrap_from_markdown(
 
     # Walk bullets
     notes_inserted = 0
+    notes_skipped = 0
     profile_updates = 0
     seen_hashes: set[str] = set()
 
@@ -118,6 +127,20 @@ def bootstrap_from_markdown(
 
         # Always also store as a note so it's searchable
         [embedding] = service.embedder.embed([bullet])
+
+        # Cross-file dedup: skip if a near-identical note already exists.
+        neighbours = service.store.search_notes_vector(embedding, k=1, only_valid=True)
+        if neighbours and neighbours[0][1] < BOOTSTRAP_DEDUP_DIST:
+            existing = neighbours[0][0]
+            logger.debug(
+                "Bootstrap: skipping near-duplicate of %s (dist=%.3f): %r",
+                existing.id[:8],
+                neighbours[0][1],
+                bullet[:60],
+            )
+            notes_skipped += 1
+            continue
+
         note = Note(
             id=str(uuid4()),
             text=bullet,
@@ -131,15 +154,17 @@ def bootstrap_from_markdown(
         notes_inserted += 1
 
     logger.info(
-        "Bootstrap complete from %s: %d notes inserted, %d profile updates",
+        "Bootstrap complete from %s: %d notes inserted, %d skipped (near-duplicate), %d profile updates",
         file_path,
         notes_inserted,
+        notes_skipped,
         profile_updates,
     )
     return BootstrapResult(
         episode_id=episode_id,
         notes_inserted=notes_inserted,
         profile_updates=profile_updates,
+        notes_skipped=notes_skipped,
     )
 
 
