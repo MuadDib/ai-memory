@@ -69,6 +69,7 @@ class Note:
     embedding_model: str = ""
     access_count: int = 0
     last_accessed_at: str | None = None  # ISO 8601 UTC
+    entities: list[str] = field(default_factory=list)  # named things: tools, projects, people
 
 
 @dataclass

@@ -66,6 +66,13 @@ class MemoryStore(Protocol):
     def get_note_embedding(self, note_id: str) -> list[float] | None:
         """Fetch the stored embedding for a note (used by clustering against existing rows)."""
 
+    def list_entity_vocab(self) -> list[str]:
+        """Return sorted list of all distinct entity slugs across valid notes.
+
+        Injected into the dream-cycle extract prompt so the LLM prefers
+        reusing known entity names over inventing new ones.
+        """
+
     # --- Episodes --------------------------------------------------------
 
     def insert_episode(self, episode: Episode, embedding: list[float] | None = None) -> None: ...

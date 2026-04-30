@@ -28,6 +28,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from typing import TYPE_CHECKING, Iterable, List, Tuple
 
 from uuid import uuid4
@@ -99,7 +100,16 @@ class _CandidateFact:
 
     text: str
     tags: List[str] = field(default_factory=list)
+    entities: List[str] = field(default_factory=list)
     source_episode_id: str = ""
+
+
+# Domain tag vocabulary — the only values the LLM is allowed to assign.
+# Lowercase, validated at extraction time; anything else is dropped.
+DOMAIN_TAGS: frozenset = frozenset({
+    "preference", "project", "technical", "workflow", "personal",
+    "problem", "fix", "person", "learning",
+})
 
 
 # --- Prompts (kept verbatim so dream-log entries can quote them later) -----
@@ -134,27 +144,71 @@ EXTRACT_SYSTEM = (
     "configurations, schemas, formulas. Be specific. Examples: "
     "'ai-memory stores notes in SQLite with the sqlite-vec extension "
     "and uses FTS5 for BM25 keyword search', 'Recall fuses vector and "
-    "BM25 results via Reciprocal Rank Fusion with k=60', 'The dream "
-    "cycle runs nightly at 03:00 via NSSM as a Windows service set to "
-    "Automatic-Delayed-Start', 'config.yaml lives under "
-    "%LOCALAPPDATA%/ai-memory/'.\n\n"
+    "BM25 results via Reciprocal Rank Fusion with k=60'.\n\n"
     "3. PROBLEMS HIT AND FIXES APPLIED — specific gotchas, error "
-    "messages, root causes, and the fix. These are NOT 'ephemeral "
-    "troubleshooting' — they are the lessons-learned that make the "
-    "memory worth having. Examples: 'PowerShell Set-Content -Encoding "
-    "utf8 writes a UTF-8 BOM that Claude Desktop rejects; fixed by "
-    "using [System.IO.File]::WriteAllText with UTF8Encoding(false)', "
-    "'Python venv creation failed on Windows MAX_PATH 260 limit until "
-    "LongPathsEnabled was set in the registry and the project moved "
-    "to C:\\\\ai-mem', 'gpt-4o-mini drops the outer [] of JSON arrays "
-    "fairly often; the parser must wrap bare comma-separated objects "
-    "and retry'.\n\n"
-    'Output a JSON array of objects: [{"text": <fact>, "tags": [<tag>, ...]}]. '
-    "Each fact is one self-contained third-person sentence. "
-    "Skip pleasantries, raw code snippets, and one-off transient "
-    "errors that were never resolved. Output ONLY the JSON array, no "
-    "prose, no markdown fences, no commentary."
+    "messages, root causes, and the fix. These are the lessons-learned "
+    "that make the memory worth having.\n\n"
+    "Each fact object has THREE fields:\n"
+    "  text     : one self-contained third-person sentence.\n"
+    "  tags     : 1-3 domain tags chosen ONLY from this fixed list:\n"
+    "               preference — something Igor prefers, values, likes, or avoids\n"
+    "               project    — a specific work or personal project\n"
+    "               technical  — stack, tools, languages, libs, config, architecture\n"
+    "               workflow   — how Igor works: process, habits, tooling choices\n"
+    "               personal   — life outside work: hobbies, lifestyle, background\n"
+    "               problem    — a bug, error, failure, or challenge encountered\n"
+    "               fix        — a solution, workaround, or resolution applied\n"
+    "               person     — someone in Igor's personal or professional life\n"
+    "               learning   — something Igor is actively studying or improving\n"
+    "             Use ONLY these exact lowercase values. Any other value is invalid.\n"
+    "  entities : 0-5 named things the fact is about (tools, projects, companies,\n"
+    "             technologies, people). Normalise to lowercase-slug:\n"
+    "             'AWS Lambda' → 'aws-lambda', 'Citywire' → 'citywire',\n"
+    "             'Visual Studio Code' → 'vscode'.\n"
+    "             PREFER REUSING existing entity names (provided below) over\n"
+    "             inventing new ones. Only create a new entity slug as a last resort.\n\n"
+    'Output a JSON array: [{"text": "...", "tags": [...], "entities": [...]}]. '
+    "Skip pleasantries, raw code snippets, and one-off transient errors. "
+    "Output ONLY the JSON array, no prose, no markdown fences."
 )
+
+# --- Entity slug helpers ---------------------------------------------------
+
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _slug(text: str) -> str:
+    """Normalise a raw entity string to a lowercase hyphen-slug."""
+    return _SLUG_RE.sub("-", text.strip().lower()).strip("-")
+
+
+def _normalise_entity(raw: str, vocab: list[str]) -> str:
+    """Slug-normalise `raw`, then fuzzy-match against existing vocabulary.
+
+    If the closest existing slug has similarity ≥ 0.85 it's returned instead,
+    collapsing near-duplicates like 'aws-lambda' vs 'lambda-aws'.
+    Returns an empty string if the input is blank after slugging.
+    """
+    slugged = _slug(raw)
+    if not slugged:
+        return ""
+    if not vocab:
+        return slugged
+    best, best_score = slugged, 0.0
+    for existing in vocab:
+        score = SequenceMatcher(None, slugged, existing).ratio()
+        if score > best_score:
+            best_score, best = score, existing
+    return best if best_score >= 0.85 else slugged
+
+
+def _build_extract_system(entity_vocab: list[str]) -> str:
+    """Return EXTRACT_SYSTEM with existing entity vocab appended (capped at 150 entries)."""
+    if not entity_vocab:
+        return EXTRACT_SYSTEM
+    vocab_str = ", ".join(entity_vocab[:150])
+    return EXTRACT_SYSTEM + f"\n\nExisting entity slugs (reuse these): {vocab_str}"
+
 
 INTEGRATE_VERDICT_SYSTEM = (
     "You are a memory consolidation worker. You receive a NEW candidate fact "
@@ -222,6 +276,11 @@ def dream(
     )
 
     # --- Phase 3: consolidate each episode -----------------------------
+    # Load entity vocab once before the loop so every extract call can
+    # steer the LLM toward reusing known entity slugs.
+    entity_vocab: list[str] = store.list_entity_vocab()
+    extract_system = _build_extract_system(entity_vocab)
+
     candidate_facts: List[_CandidateFact] = []
     for ep in episodes:
         turns = list(store.get_turns_for_episode(ep.id))
@@ -261,7 +320,7 @@ def dream(
                 + chunk_transcript
             )
             extract_completion = llm.complete(
-                system=EXTRACT_SYSTEM,
+                system=extract_system,
                 messages=[Message(role="user", content=extract_user_msg)],
                 max_tokens=4000,
             )
@@ -311,9 +370,19 @@ def dream(
             text = (fact.get("text") or "").strip()
             if not text:
                 continue
-            tags = [str(t) for t in fact.get("tags") or []] + [ep.source]
+            # Domain tags: validate against controlled vocabulary, lowercase.
+            # Drop any tag the LLM invented outside the allowed set; always
+            # append the episode source as a provenance tag.
+            raw_tags = [str(t).lower() for t in (fact.get("tags") or [])]
+            tags = [t for t in raw_tags if t in DOMAIN_TAGS] + [ep.source]
+            # Entities: slug-normalise and fuzzy-match against known vocab.
+            raw_entities = [str(e) for e in (fact.get("entities") or [])]
+            entities = [
+                norm for e in raw_entities
+                if (norm := _normalise_entity(e, entity_vocab))
+            ]
             candidate_facts.append(
-                _CandidateFact(text=text, tags=tags, source_episode_id=ep.id)
+                _CandidateFact(text=text, tags=tags, entities=entities, source_episode_id=ep.id)
             )
 
         ep_candidates = len([f for f in candidate_facts if f.source_episode_id == ep.id])
@@ -496,6 +565,7 @@ def _insert_candidate(
         id=str(uuid4()),
         text=cand.text,
         tags=cand.tags,
+        entities=cand.entities,
         source_episode_ids=[cand.source_episode_id] if cand.source_episode_id else [],
         valid_from=now,
         ingested_at=now,
@@ -637,12 +707,17 @@ def _euclid_distance(a: List[float], b: List[float]) -> float:
     return math.sqrt(sum((x - y) * (x - y) for x, y in zip(a, b)))
 
 
-_KEY_SANITISE = re.compile(r"[^a-z0-9_]+")
+_KEY_SANITISE = re.compile(r"[^a-z0-9]+")
+_KEY_COLLAPSE = re.compile(r"_+")
 
 
 def _sanitise_profile_key(key: str) -> str:
-    """Force snake_case-ish; LLM sometimes returns 'Preferred Database' etc."""
-    cleaned = _KEY_SANITISE.sub("_", key.strip().lower()).strip("_")
+    """Force snake_case; LLM sometimes returns 'Preferred Database' etc.
+
+    Non-alphanumeric runs → single underscore; repeated underscores collapsed.
+    """
+    cleaned = _KEY_SANITISE.sub("_", key.strip().lower())
+    cleaned = _KEY_COLLAPSE.sub("_", cleaned).strip("_")
     return cleaned or "fact"
 
 

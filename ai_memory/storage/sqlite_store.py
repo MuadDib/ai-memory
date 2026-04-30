@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS notes (
   promoted_to_profile   INTEGER NOT NULL DEFAULT 0,
   embedding_model       TEXT NOT NULL,
   access_count          INTEGER NOT NULL DEFAULT 0,
-  last_accessed_at      TEXT
+  last_accessed_at      TEXT,
+  entities              TEXT NOT NULL DEFAULT '[]'  -- JSON array of lowercase-slug entity tags
 );
 
 CREATE INDEX IF NOT EXISTS notes_valid_to     ON notes(valid_to);
@@ -131,7 +132,7 @@ CREATE INDEX IF NOT EXISTS eval_results_run_id  ON eval_results(run_id);
 CREATE INDEX IF NOT EXISTS eval_results_case_id ON eval_results(case_id, run_at);
 """
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Migration SQL run once when upgrading from schema version 1 (Unix int
 # timestamps) to version 2 (ISO 8601 UTC strings).  The WHERE guards make
@@ -204,6 +205,11 @@ CREATE TABLE IF NOT EXISTS eval_results (
 
 CREATE INDEX IF NOT EXISTS eval_results_run_id  ON eval_results(run_id);
 CREATE INDEX IF NOT EXISTS eval_results_case_id ON eval_results(case_id, run_at);
+"""
+
+# Migration v3→v4: adds entities column to notes (domain-split tag taxonomy).
+_MIGRATION_V3_TO_V4 = """
+ALTER TABLE notes ADD COLUMN entities TEXT NOT NULL DEFAULT '[]';
 """
 
 
@@ -279,6 +285,14 @@ class SqliteStore:
             conn.executescript(_MIGRATION_V1_TO_V2)
         if current_version < 3:
             conn.executescript(_MIGRATION_V2_TO_V3)
+        if current_version < 4:
+            # Only ALTER when upgrading an existing DB; fresh DBs already have
+            # the column from SCHEMA_SQL, so guard against "duplicate column".
+            existing_cols = {
+                r[1] for r in conn.execute("PRAGMA table_info(notes)").fetchall()
+            }
+            if "entities" not in existing_cols:
+                conn.executescript(_MIGRATION_V3_TO_V4)
 
         # Record schema version (idempotent insert)
         conn.execute(
@@ -336,11 +350,11 @@ class SqliteStore:
                 INSERT INTO notes(
                     id, text, tags, source_episode_ids, valid_from, valid_to,
                     ingested_at, superseded_by, contradicts, promoted_to_profile,
-                    embedding_model, access_count, last_accessed_at
+                    embedding_model, access_count, last_accessed_at, entities
                 ) VALUES (
                     :id, :text, :tags, :source_episode_ids, :valid_from, :valid_to,
                     :ingested_at, :superseded_by, :contradicts, :promoted_to_profile,
-                    :embedding_model, :access_count, :last_accessed_at
+                    :embedding_model, :access_count, :last_accessed_at, :entities
                 )
                 """,
                 _note_to_row(note),
@@ -368,7 +382,8 @@ class SqliteStore:
                     contradicts = :contradicts,
                     promoted_to_profile = :promoted_to_profile,
                     access_count = :access_count,
-                    last_accessed_at = :last_accessed_at
+                    last_accessed_at = :last_accessed_at,
+                    entities = :entities
                 WHERE id = :id
                 """,
                 _note_to_row(note),
@@ -452,6 +467,24 @@ class SqliteStore:
                 "SELECT * FROM notes WHERE valid_to IS NULL ORDER BY ingested_at"
             ).fetchall()
         return [_row_to_note(r) for r in rows]
+
+    def list_entity_vocab(self) -> list[str]:
+        """Return all distinct entity slugs across valid notes, sorted.
+
+        Used by the dream cycle to inject existing vocabulary into the extract
+        prompt so the LLM prefers reusing known entity names.
+        """
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT DISTINCT je.value AS entity
+                FROM notes, json_each(notes.entities) AS je
+                WHERE notes.valid_to IS NULL
+                  AND je.value != ''
+                ORDER BY je.value
+                """
+            ).fetchall()
+        return [str(r["entity"]) for r in rows]
 
     def get_note_embedding(self, note_id: str) -> list[float] | None:
         """Read back the stored vector for a note. Used to seed clustering against existing rows."""
@@ -735,6 +768,7 @@ def _note_to_row(note: Note) -> dict:
         "embedding_model": note.embedding_model,
         "access_count": note.access_count,
         "last_accessed_at": note.last_accessed_at,
+        "entities": json.dumps(note.entities),
     }
 
 
@@ -753,6 +787,7 @@ def _row_to_note(row: sqlite3.Row) -> Note:
         embedding_model=row["embedding_model"],
         access_count=int(row["access_count"]),
         last_accessed_at=str(row["last_accessed_at"]) if row["last_accessed_at"] is not None else None,
+        entities=_json_or_default(row["entities"], []),
     )
 
 
