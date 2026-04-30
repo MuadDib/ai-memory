@@ -56,7 +56,7 @@ UNRELATED_DIST_ABOVE = 0.55   # clearly unrelated -> insert without LLM
 INTEGRATE_NEIGHBOURS = 5      # how many existing notes to compare a candidate against
 
 # Phase 5 — promotion clustering.
-PROMOTION_CLUSTER_DIST = 0.30   # join two notes into a cluster if they're closer than this
+PROMOTION_CLUSTER_DIST = 0.65   # join two notes into a cluster if they're closer than this
 PROMOTION_MIN_NOTES = 3         # cluster size required to consider promoting
 PROMOTION_MIN_EPISODES = 2      # number of distinct episodes the cluster must span
 
@@ -539,6 +539,12 @@ def _phase5_promote(
 
     min_episodes = max(PROMOTION_MIN_EPISODES, config.promotion_min_episodes)
     min_notes = max(PROMOTION_MIN_NOTES, config.promotion_min_endorsing_notes)
+
+    journal.append(
+        f"Phase 5: {len(valid_notes)} notes clustered at dist≤{PROMOTION_CLUSTER_DIST} "
+        f"→ {len(clusters)} multi-note clusters "
+        f"(need ≥{min_notes} notes across ≥{min_episodes} episodes)"
+    )
 
     for cluster in clusters:
         if len(cluster) < min_notes:

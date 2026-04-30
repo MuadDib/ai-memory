@@ -51,7 +51,7 @@ class DreamConfig:
     idle_trigger_minutes: int = 20
     pressure_trigger_turns: int = 200
     promotion_min_endorsing_notes: int = 3
-    promotion_min_episodes: int = 3
+    promotion_min_episodes: int = 2
     decay_half_life_days: int = 90
     prune_threshold: float = 0.05
 
