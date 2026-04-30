@@ -6,16 +6,41 @@ phases themselves are covered by end-to-end tests once they exist.
 """
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
+import pytest
+
 from ai_memory.core.dreaming import (
+    _ExtractedFact,
+    _IntegrateVerdict,
+    _PromotionResult,
     _cluster_notes,
     _euclid_distance,
     _chunk_turns,
+    _llm_call_with_retry,
+    _parse_extract_facts,
+    _parse_promotion,
+    _parse_verdicts,
     _safe_parse_facts,
     _safe_parse_json,
     _sanitise_profile_key,
 )
 from ai_memory.core.models import Note
+from ai_memory.llm.interface import CompletionResult, Message
 from ai_memory.timestamps import now_iso
+
+
+def _mock_llm(*responses: str) -> MagicMock:
+    """Return a mock Llm that cycles through the given response texts."""
+    llm = MagicMock()
+    llm.model_id = "mock"
+    llm.complete.side_effect = [
+        CompletionResult(
+            text=r, input_tokens=10, output_tokens=5, model_id="mock", finish_reason="stop"
+        )
+        for r in responses
+    ]
+    return llm
 
 
 # --- Distance --------------------------------------------------------------
@@ -192,3 +217,159 @@ def test_chunk_turns_exact_multiple() -> None:
     chunks = _chunk_turns(turns, chunk_size=50, overlap=5)
     assert len(chunks) == 1
     assert chunks[0] == turns
+
+
+# --- Pydantic parse functions -----------------------------------------------
+
+
+def test_parse_extract_facts_valid() -> None:
+    raw = '[{"text": "Igor uses PostgreSQL", "tags": ["technical"], "entities": ["postgresql"]}]'
+    facts = _parse_extract_facts(raw)
+    assert len(facts) == 1
+    assert facts[0].text == "Igor uses PostgreSQL"
+    assert facts[0].tags == ["technical"]
+    assert facts[0].entities == ["postgresql"]
+
+
+def test_parse_extract_facts_skips_empty_text() -> None:
+    raw = '[{"text": "", "tags": []}, {"text": "valid fact", "tags": []}]'
+    facts = _parse_extract_facts(raw)
+    assert len(facts) == 1
+    assert facts[0].text == "valid fact"
+
+
+def test_parse_extract_facts_single_object() -> None:
+    """LLM returns a bare object instead of an array — handled."""
+    raw = '{"text": "only fact", "tags": ["preference"], "entities": []}'
+    facts = _parse_extract_facts(raw)
+    assert len(facts) == 1
+
+
+def test_parse_extract_facts_raises_on_complete_garbage() -> None:
+    with pytest.raises(ValueError):
+        _parse_extract_facts("not json at all")
+
+
+def test_parse_verdicts_valid() -> None:
+    raw = '[{"existing_id": "abc", "verdict": "DUPLICATE", "reason": "same fact"}]'
+    verdicts = _parse_verdicts(raw)
+    assert len(verdicts) == 1
+    assert verdicts[0].verdict == "DUPLICATE"
+    assert verdicts[0].existing_id == "abc"
+
+
+def test_parse_verdicts_invalid_enum_skipped() -> None:
+    """Items with an invalid verdict value are skipped; valid ones are kept."""
+    raw = (
+        '[{"existing_id": "a", "verdict": "DUPLICATE", "reason": ""},'
+        ' {"existing_id": "b", "verdict": "INVENTED_VERDICT", "reason": ""}]'
+    )
+    verdicts = _parse_verdicts(raw)
+    assert len(verdicts) == 1
+    assert verdicts[0].existing_id == "a"
+
+
+def test_parse_verdicts_raises_when_all_invalid() -> None:
+    raw = '[{"existing_id": "x", "verdict": "GARBAGE"}]'
+    with pytest.raises(ValueError):
+        _parse_verdicts(raw)
+
+
+def test_parse_promotion_valid() -> None:
+    raw = '{"key": "preferred_db", "value": "PostgreSQL", "rationale": "mentioned often"}'
+    p = _parse_promotion(raw)
+    assert p.key == "preferred_db"
+    assert p.value == "PostgreSQL"
+
+
+def test_parse_promotion_null_signals_decline() -> None:
+    """LLM returning null means 'do not promote'."""
+    p = _parse_promotion("null")
+    assert p.key is None
+    assert p.value is None
+
+
+def test_parse_promotion_missing_fields_returns_empty() -> None:
+    p = _parse_promotion("{}")
+    assert p.key is None
+    assert p.value is None
+
+
+# --- Retry helper ------------------------------------------------------------
+
+
+def test_llm_call_with_retry_success_first_attempt() -> None:
+    llm = _mock_llm('[{"text": "a fact", "tags": [], "entities": []}]')
+    result, tokens = _llm_call_with_retry(
+        llm=llm,
+        system="sys",
+        user_msg="user",
+        parse_fn=_parse_extract_facts,
+        max_tokens=100,
+        default=[],
+    )
+    assert len(result) == 1
+    assert result[0].text == "a fact"
+    assert llm.complete.call_count == 1
+    assert tokens == 15  # 10 input + 5 output
+
+
+def test_llm_call_with_retry_succeeds_on_second_attempt() -> None:
+    """First response is invalid JSON; second is valid — retry succeeds."""
+    llm = _mock_llm(
+        "not json at all",
+        '[{"text": "retried fact", "tags": [], "entities": []}]',
+    )
+    result, tokens = _llm_call_with_retry(
+        llm=llm,
+        system="sys",
+        user_msg="user",
+        parse_fn=_parse_extract_facts,
+        max_tokens=100,
+        default=[],
+    )
+    assert len(result) == 1
+    assert result[0].text == "retried fact"
+    assert llm.complete.call_count == 2
+    assert tokens == 30  # two calls × 15 tokens each
+
+
+def test_llm_call_with_retry_returns_default_after_two_failures() -> None:
+    """Both attempts fail — returns the default without raising."""
+    llm = _mock_llm("garbage", "still garbage")
+    result, tokens = _llm_call_with_retry(
+        llm=llm,
+        system="sys",
+        user_msg="user",
+        parse_fn=_parse_extract_facts,
+        max_tokens=100,
+        default=[],
+    )
+    assert result == []
+    assert llm.complete.call_count == 2
+
+
+def test_llm_call_with_retry_passes_error_context_to_second_call() -> None:
+    """Retry call must include the bad output + an error correction message."""
+    llm = _mock_llm(
+        "bad output",
+        '[{"text": "fixed", "tags": [], "entities": []}]',
+    )
+    _llm_call_with_retry(
+        llm=llm,
+        system="sys",
+        user_msg="original user msg",
+        parse_fn=_parse_extract_facts,
+        max_tokens=100,
+        default=[],
+    )
+    _, retry_kwargs = llm.complete.call_args_list[1]
+    retry_messages: list[Message] = retry_kwargs.get("messages") or llm.complete.call_args_list[1][0][1]
+    # Retry should send a 3-turn conversation:
+    # user (original), assistant (bad output), user (error correction)
+    assert len(retry_messages) == 3
+    assert retry_messages[0]["role"] == "user"
+    assert retry_messages[1]["role"] == "assistant"
+    assert retry_messages[1]["content"] == "bad output"
+    assert retry_messages[2]["role"] == "user"
+    assert "invalid" in retry_messages[2]["content"].lower()

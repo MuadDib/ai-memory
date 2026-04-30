@@ -29,9 +29,11 @@ import math
 import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
-from typing import TYPE_CHECKING, Iterable, List, Tuple
+from typing import TYPE_CHECKING, Callable, Iterable, List, Literal, Tuple, TypeVar
 
 from uuid import uuid4
+
+from pydantic import BaseModel, ValidationError
 
 from ai_memory.config import DreamConfig
 from ai_memory.core.models import DreamLog, Note, Profile
@@ -102,6 +104,33 @@ class _CandidateFact:
     tags: List[str] = field(default_factory=list)
     entities: List[str] = field(default_factory=list)
     source_episode_id: str = ""
+
+
+# --- Pydantic response models (schema-enforce LLM JSON output) ---------------
+
+class _ExtractedFact(BaseModel):
+    """One fact returned by the Phase 3 extract prompt."""
+    text: str
+    tags: List[str] = []
+    entities: List[str] = []
+
+
+class _IntegrateVerdict(BaseModel):
+    """One verdict returned by the Phase 4 classify prompt."""
+    existing_id: str
+    verdict: Literal["DUPLICATE", "CONTRADICTS", "COMPLEMENTS", "UNRELATED"]
+    reason: str = ""
+
+
+class _PromotionResult(BaseModel):
+    """Promotion decision returned by the Phase 5 promotion prompt."""
+    key: str | None = None
+    value: str | None = None
+    rationale: str = ""
+
+
+_T = TypeVar("_T")
+_MISSING = object()  # sentinel for _safe_parse_json failure detection
 
 
 # Domain tag vocabulary — the only values the LLM is allowed to assign.
@@ -308,10 +337,8 @@ def dream(
         # Extract: chunked. For short episodes _chunk_turns returns a single
         # window so behaviour is identical to the old single-shot path.
         turn_chunks = _chunk_turns(turns)
-        all_facts: List[dict] = []
-        chunk_finish_reasons: List[str] = []
+        all_facts: List[_ExtractedFact] = []
         chunk_sizes: List[int] = []
-        any_extract_text = False
         for chunk_turns in turn_chunks:
             chunk_transcript = _render_transcript(raw, chunk_turns)
             extract_user_msg = (
@@ -321,18 +348,17 @@ def dream(
                 "JSON array.\n\n"
                 + chunk_transcript
             )
-            extract_completion = llm.complete(
+            chunk_facts, chunk_tokens = _llm_call_with_retry(
+                llm=llm,
                 system=extract_system,
-                messages=[Message(role="user", content=extract_user_msg)],
+                user_msg=extract_user_msg,
+                parse_fn=_parse_extract_facts,
                 max_tokens=4000,
+                default=[],
             )
-            tokens_used += extract_completion.input_tokens + extract_completion.output_tokens
-            chunk_facts = _safe_parse_facts(extract_completion.text)
+            tokens_used += chunk_tokens
             all_facts.extend(chunk_facts)
-            chunk_finish_reasons.append(extract_completion.finish_reason)
             chunk_sizes.append(len(chunk_facts))
-            if extract_completion.text.strip():
-                any_extract_text = True
 
         # Persist summary + mark consolidated only if we produced something.
         ep.summary = summary_completion.text.strip()
@@ -369,18 +395,17 @@ def dream(
         store.update_episode(ep, embedding=summary_embedding)
 
         for fact in all_facts:
-            text = (fact.get("text") or "").strip()
+            text = fact.text.strip()
             if not text:
                 continue
             # Domain tags: validate against controlled vocabulary, lowercase.
             # Drop any tag the LLM invented outside the allowed set; always
             # append the episode source as a provenance tag.
-            raw_tags = [str(t).lower() for t in (fact.get("tags") or [])]
+            raw_tags = [t.lower() for t in fact.tags]
             tags = [t for t in raw_tags if t in DOMAIN_TAGS] + [ep.source]
             # Entities: slug-normalise and fuzzy-match against known vocab.
-            raw_entities = [str(e) for e in (fact.get("entities") or [])]
             entities = [
-                norm for e in raw_entities
+                norm for e in fact.entities
                 if (norm := _normalise_entity(e, entity_vocab))
             ]
             candidate_facts.append(
@@ -393,13 +418,12 @@ def dream(
             f"transcript_chars={len(transcript)} summary={len(ep.summary)} chars "
             f"(finish={summary_completion.finish_reason}"
             f"{', refusal=' + summary_completion.refusal[:120] if summary_completion.refusal else ''}) "
-            f"candidates={ep_candidates} (per-chunk={chunk_sizes}, "
-            f"finishes={chunk_finish_reasons})"
+            f"candidates={ep_candidates} (per-chunk={chunk_sizes})"
         )
-        if ep_candidates == 0 and any_extract_text:
+        if ep_candidates == 0:
             journal.append(
-                "    note: chunks produced text but parser found 0 facts — "
-                "investigate response format"
+                "    note: 0 candidate facts extracted — "
+                "short episode, parse failure (see logs), or all facts deduplicated"
             )
 
     # --- Phase 4: integrate candidate facts ----------------------------
@@ -505,19 +529,17 @@ def _phase4_integrate(
 
         action_taken = False
         for v in verdicts:
-            verdict = (v.get("verdict") or "").upper()
-            existing_id = v.get("existing_id") or ""
-            if verdict == "DUPLICATE":
-                store.bump_note_access(existing_id, now)
+            if v.verdict == "DUPLICATE":
+                store.bump_note_access(v.existing_id, now)
                 deduped += 1
                 action_taken = True
                 break  # done with this candidate
-            if verdict == "CONTRADICTS":
+            if v.verdict == "CONTRADICTS":
                 # Insert the new fact, then invalidate the old one and link them.
                 new_id = _insert_candidate(
-                    store, cand, cand_emb, embedder, now, contradicts=[existing_id]
+                    store, cand, cand_emb, embedder, now, contradicts=[v.existing_id]
                 )
-                store.invalidate_note(existing_id, when=now, superseded_by=new_id)
+                store.invalidate_note(v.existing_id, when=now, superseded_by=new_id)
                 invalidated += 1
                 added += 1
                 action_taken = True
@@ -537,21 +559,21 @@ def _phase4_integrate(
 
 def _classify_candidate_vs_neighbours(
     *, llm: Llm, candidate_text: str, neighbours: List[Tuple[Note, float]]
-) -> Tuple[List[dict], int]:
+) -> Tuple[List[_IntegrateVerdict], int]:
     """One LLM call that classifies the candidate against all K neighbours."""
     payload = {
         "candidate": candidate_text,
         "existing": [{"id": n.id, "text": n.text} for n, _ in neighbours],
     }
-    completion = llm.complete(
+    verdicts, tokens = _llm_call_with_retry(
+        llm=llm,
         system=INTEGRATE_VERDICT_SYSTEM,
-        messages=[Message(role="user", content=json.dumps(payload, ensure_ascii=False))],
+        user_msg=json.dumps(payload, ensure_ascii=False),
+        parse_fn=_parse_verdicts,
         max_tokens=800,
+        default=[],
     )
-    verdicts = _safe_parse_json(completion.text, default=[])
-    if not isinstance(verdicts, list):
-        verdicts = []
-    return verdicts, completion.input_tokens + completion.output_tokens
+    return verdicts, tokens
 
 
 def _insert_candidate(
@@ -613,7 +635,7 @@ def _phase5_promote(
     min_notes = max(PROMOTION_MIN_NOTES, config.promotion_min_endorsing_notes)
 
     journal.append(
-        f"Phase 5: {len(valid_notes)} notes clustered at dist≤{PROMOTION_CLUSTER_DIST} "
+        f"Phase 5: {len(valid_notes)} notes clustered at dist<={PROMOTION_CLUSTER_DIST} "
         f"→ {len(clusters)} multi-note clusters "
         f"(need ≥{min_notes} notes across ≥{min_episodes} episodes)"
     )
@@ -627,18 +649,18 @@ def _phase5_promote(
 
         # Ask the LLM whether this cluster is worth promoting and what key/value to use.
         cluster_payload = [{"id": n.id, "text": n.text} for n in cluster]
-        completion = llm.complete(
+        promotion, promo_tokens = _llm_call_with_retry(
+            llm=llm,
             system=PROMOTION_SYSTEM,
-            messages=[
-                Message(role="user", content=json.dumps(cluster_payload, ensure_ascii=False))
-            ],
+            user_msg=json.dumps(cluster_payload, ensure_ascii=False),
+            parse_fn=_parse_promotion,
             max_tokens=300,
+            default=_PromotionResult(),
         )
-        tokens += completion.input_tokens + completion.output_tokens
+        tokens += promo_tokens
 
-        verdict = _safe_parse_json(completion.text, default={})
-        key = (verdict.get("key") or "").strip() if isinstance(verdict, dict) else ""
-        value = (verdict.get("value") or "").strip() if isinstance(verdict, dict) else ""
+        key = (promotion.key or "").strip()
+        value = (promotion.value or "").strip()
 
         if not key or not value:
             continue  # LLM declined promotion
@@ -806,6 +828,128 @@ def _render_transcript(raw: RawTranscriptStore, turns: Iterable) -> str:
         lines.append("</turn>")
     lines.append("</conversation_transcript>")
     return "\n".join(lines)
+
+
+def _llm_call_with_retry(
+    *,
+    llm: "Llm",
+    system: str,
+    user_msg: str,
+    parse_fn: "Callable[[str], _T]",
+    max_tokens: int,
+    default: "_T",
+) -> "Tuple[_T, int]":
+    """Make an LLM call, validate with parse_fn, retry once on schema failure.
+
+    Returns (result, total_tokens_used).
+
+    parse_fn should raise ValueError or ValidationError for bad output.
+    JSON-level quirks (markdown fences, prose preambles) are handled
+    by _safe_parse_json before Pydantic sees the data; this retry
+    fires only when the structure is wrong (missing fields, bad enum).
+    """
+    completion = llm.complete(
+        system=system,
+        messages=[Message(role="user", content=user_msg)],
+        max_tokens=max_tokens,
+    )
+    tokens = completion.input_tokens + completion.output_tokens
+
+    first_error: str = ""
+    try:
+        return parse_fn(completion.text), tokens
+    except (ValueError, ValidationError) as err:
+        first_error = str(err)
+        logger.warning("LLM output validation failed (retrying once): %s", first_error)
+
+    retry_completion = llm.complete(
+        system=system,
+        messages=[
+            Message(role="user", content=user_msg),
+            Message(role="assistant", content=completion.text),
+            Message(
+                role="user",
+                content=(
+                    f"Your previous response was invalid: {first_error}. "
+                    "Fix it and output ONLY valid JSON matching the required schema."
+                ),
+            ),
+        ],
+        max_tokens=max_tokens,
+    )
+    tokens += retry_completion.input_tokens + retry_completion.output_tokens
+
+    try:
+        return parse_fn(retry_completion.text), tokens
+    except (ValueError, ValidationError) as err2:
+        logger.error("LLM output validation failed after retry — using default: %s", err2)
+        return default, tokens
+
+
+def _parse_extract_facts(text: str) -> List[_ExtractedFact]:
+    """Parse and validate the Phase 3 extract JSON array.
+
+    Raises ValueError if the text contains no valid JSON at all, so that
+    _llm_call_with_retry knows to retry. Returns [] (no error) for a valid
+    empty array — the LLM is allowed to find zero facts in a short transcript.
+    """
+    text = text.strip()
+    if not text:
+        return []
+    parsed = _safe_parse_json(text, default=_MISSING)
+    if parsed is _MISSING:
+        raise ValueError(f"No valid JSON in response: {text[:120]!r}")
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        raise ValueError(f"Expected JSON array, got {type(parsed).__name__}")
+    facts: List[_ExtractedFact] = []
+    errors: List[str] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        try:
+            f = _ExtractedFact.model_validate(item)
+            if f.text.strip():
+                facts.append(f)
+        except ValidationError as e:
+            errors.append(str(e))
+    if errors and not facts:
+        raise ValueError(f"All {len(errors)} fact(s) failed validation: {errors[0]}")
+    return facts
+
+
+def _parse_verdicts(text: str) -> List[_IntegrateVerdict]:
+    """Parse and validate the Phase 4 verdict JSON array."""
+    parsed = _safe_parse_json(text, default=_MISSING)
+    if parsed is _MISSING:
+        raise ValueError(f"No valid JSON in response: {text[:120]!r}")
+    if not isinstance(parsed, list):
+        raise ValueError(f"Expected JSON array, got {type(parsed).__name__}")
+    verdicts: List[_IntegrateVerdict] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        try:
+            verdicts.append(_IntegrateVerdict.model_validate(item))
+        except ValidationError:
+            pass
+    if not verdicts and parsed:
+        raise ValueError(f"No valid verdict objects parsed from {len(parsed)} items")
+    return verdicts
+
+
+def _parse_promotion(text: str) -> _PromotionResult:
+    """Parse and validate the Phase 5 promotion JSON object."""
+    parsed = _safe_parse_json(text, default=_MISSING)
+    # LLM may return null/None to signal 'do not promote'
+    if parsed is None:
+        return _PromotionResult()
+    if parsed is _MISSING:
+        raise ValueError(f"No valid JSON in response: {text[:120]!r}")
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Expected JSON object, got {type(parsed).__name__}")
+    return _PromotionResult.model_validate(parsed)
 
 
 def _safe_parse_facts(text: str) -> List[dict]:
