@@ -45,15 +45,14 @@ These are listed in proposal v3 + v4:
 
 ## Open follow-ups (priority order)
 
-1. **Phase 4 dedup tuning** — `DUPLICATE_DIST_BELOW` raised 0.10 → 0.20; verdict prompt biased toward DUPLICATE. Will validate on next dream run. `UNRELATED_DIST_ABOVE = 0.55` unchanged.
-2. **Phase 4 contradiction detection** — `invalidated=0` even on direct contradictions. Mid-band similarity LLM-verdict branch isn't earning its call. Needs prompt work + eval cases.
-3. **Pydantic output validation with retry** — LLM JSON output for extract/verdict prompts has no schema enforcement. One bad parse silently drops facts. Add Pydantic models + one retry on validation error.
-4. **`ai-memory redream --episode <id> [--purge-notes]` admin subcommand** — productise the reset-and-redream recipe. Support `--all-pending` and `--latest` too.
-5. **Auto-upgrade to `gpt-4o` for long episodes** — Phase 4 quality looks model-bound. Per-call escalation rule.
-6. **Pre-render redaction** — privacy filter runs before persistence, but assembled transcript still has raw creds when sent to OpenAI for dream cycles.
-7. **Expand eval suite** — add cases for dedup quality and promotion quality; currently only 10 recall cases.
+1. **`ai-memory redream --episode <id> [--purge-notes]` admin subcommand** — productise the reset-and-redream recipe. Support `--all-pending` and `--latest` too.
+2. **Auto-upgrade to `gpt-4o` for long episodes** — Phase 4 quality looks model-bound. Per-call escalation rule based on turn count or token estimate.
+3. **Pre-render redaction** — privacy filter runs before persistence, but the assembled transcript still has raw creds when sent to OpenAI for dream cycles.
+4. **Expand eval suite** — add dedup quality and promotion quality cases; currently 17 recall cases only.
+5. **Phase 5 promotion quality** — PROMOTION_SYSTEM still occasionally promotes facts *about* external entities (e.g. British Gas) rather than facts about Igor. Prompt tightening + eval cases.
+6. **Bootstrap entity backfill** — 93 bootstrap notes have zero entities. Either run a one-off entity extraction pass or add entity extraction to bootstrap ingest.
 
-Done: eval harness; Phase 5 fix (`PROMOTION_CLUSTER_DIST` 0.30→0.65, `promotion_min_episodes` 3→2); tag taxonomy redesign (9 domain tags + entities field, entity vocab injection, fuzzy normalisation); bootstrap importer nesting fix; corpus reset + redream (26 episodes → 501 clean notes with tags+entities).
+Done: eval harness (17/17 passing); Phase 5 fix; tag taxonomy redesign (9 domain tags + entities); bootstrap nesting fix; corpus reset + redream; Phase 4 dedup threshold 0.10→0.20 + DUPLICATE-biased verdict prompt; Phase 4 contradiction detection prompt rewrite + explicit equivalent-naming exclusion; Pydantic output validation + retry (`_llm_call_with_retry`); bootstrap cross-file dedup (two-tier: vector threshold 0.30 + mid-band LLM check up to 0.40).
 
 Still pending from earlier: incremental Phase 3 dreaming, `remember --from-stdin`, cross-encoder rerank, local sentence-transformers embedder, Linux daemon mode.
 
