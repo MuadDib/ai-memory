@@ -13,6 +13,7 @@ import pytest
 
 from ai_memory.bootstrap import (
     BOOTSTRAP_DEDUP_DIST,
+    BOOTSTRAP_DEDUP_MIDBAND,
     BootstrapResult,
     _is_useless,
     _iter_bullets,
@@ -98,8 +99,25 @@ def test_iter_bullets_label_only_not_emitted() -> None:
 # Cross-file dedup guard in bootstrap_from_markdown
 # ---------------------------------------------------------------------------
 
-def _make_service_mock(*, nearest_dist: float | None = None) -> MagicMock:
-    """Return a MemoryService mock wired up for bootstrap_from_markdown."""
+def _make_llm_mock(verdict: str = "KEEP") -> MagicMock:
+    """Return an LLM mock that responds with `verdict` from .complete().text."""
+    llm = MagicMock()
+    completion = MagicMock()
+    completion.text = verdict
+    llm.complete.return_value = completion
+    return llm
+
+
+def _make_service_mock(
+    *,
+    nearest_dist: float | None = None,
+    llm_verdict: str = "KEEP",
+) -> MagicMock:
+    """Return a MemoryService mock wired up for bootstrap_from_markdown.
+
+    `llm_verdict` controls what the LLM mock returns when a mid-band
+    similarity check is triggered (BOOTSTRAP_DEDUP_DIST <= dist < BOOTSTRAP_DEDUP_MIDBAND).
+    """
     svc = MagicMock()
     # config.exports_dir needs to be a real path we can write to.
     tmp = Path(tempfile.mkdtemp())
@@ -108,6 +126,7 @@ def _make_service_mock(*, nearest_dist: float | None = None) -> MagicMock:
 
     svc.embedder.embed.return_value = [[0.0] * 1536]
     svc.embedder.model_id = "text-embedding-3-small"
+    svc.llm = _make_llm_mock(llm_verdict)
 
     if nearest_dist is None:
         # No similar notes exist yet
@@ -116,6 +135,7 @@ def _make_service_mock(*, nearest_dist: float | None = None) -> MagicMock:
         # Simulate an existing note at distance `nearest_dist`
         existing = MagicMock(spec=Note)
         existing.id = "aabbccdd-0000-0000-0000-000000000000"
+        existing.text = "Existing fact text"
         svc.store.search_notes_vector.return_value = [(existing, nearest_dist)]
 
     return svc
@@ -140,15 +160,17 @@ def test_dedup_near_duplicate_skipped(tmp_path: Path) -> None:
 
 
 def test_dedup_distant_note_inserted(tmp_path: Path) -> None:
-    """A note whose nearest neighbour is beyond BOOTSTRAP_DEDUP_DIST is inserted."""
-    svc = _make_service_mock(nearest_dist=BOOTSTRAP_DEDUP_DIST + 0.05)
+    """A note beyond BOOTSTRAP_DEDUP_MIDBAND is inserted without any LLM call."""
+    svc = _make_service_mock(nearest_dist=BOOTSTRAP_DEDUP_MIDBAND + 0.05)
     md = _write_md(tmp_path, "- Uses PostgreSQL for the main database\n")
 
     result = bootstrap_from_markdown(service=svc, file_path=md, source="test")
 
     assert result.notes_inserted == 1
     assert result.notes_skipped == 0
+    assert result.notes_llm_deduped == 0
     svc.store.insert_note.assert_called_once()
+    svc.llm.complete.assert_not_called()  # beyond mid-band: no LLM needed
 
 
 def test_dedup_no_existing_notes_inserts(tmp_path: Path) -> None:
@@ -160,21 +182,81 @@ def test_dedup_no_existing_notes_inserts(tmp_path: Path) -> None:
 
     assert result.notes_inserted == 2
     assert result.notes_skipped == 0
+    assert result.notes_llm_deduped == 0
 
 
 def test_dedup_threshold_boundary_exact(tmp_path: Path) -> None:
-    """A neighbour at exactly BOOTSTRAP_DEDUP_DIST is NOT skipped (strictly less than)."""
-    svc = _make_service_mock(nearest_dist=BOOTSTRAP_DEDUP_DIST)
+    """A neighbour at exactly BOOTSTRAP_DEDUP_DIST triggers the mid-band LLM check."""
+    # LLM says KEEP → should be inserted
+    svc = _make_service_mock(nearest_dist=BOOTSTRAP_DEDUP_DIST, llm_verdict="KEEP")
     md = _write_md(tmp_path, "- Uses Python for scripting\n")
 
     result = bootstrap_from_markdown(service=svc, file_path=md, source="test")
 
-    # dist == threshold → not < threshold → not skipped
+    # dist == threshold → not < threshold → mid-band LLM check → KEEP → inserted
     assert result.notes_inserted == 1
     assert result.notes_skipped == 0
+    assert result.notes_llm_deduped == 0
+    svc.llm.complete.assert_called_once()
 
 
-def test_bootstrap_result_has_skipped_field() -> None:
-    """BootstrapResult dataclass exposes notes_skipped defaulting to 0."""
+# ---------------------------------------------------------------------------
+# Mid-band LLM dedup tests
+# ---------------------------------------------------------------------------
+
+def test_dedup_midband_llm_says_duplicate(tmp_path: Path) -> None:
+    """Mid-band note classified DUPLICATE by LLM is skipped."""
+    dist = (BOOTSTRAP_DEDUP_DIST + BOOTSTRAP_DEDUP_MIDBAND) / 2
+    svc = _make_service_mock(nearest_dist=dist, llm_verdict="DUPLICATE")
+    md = _write_md(tmp_path, "- Role: C# programmer and team lead\n")
+
+    result = bootstrap_from_markdown(service=svc, file_path=md, source="test")
+
+    assert result.notes_llm_deduped == 1
+    assert result.notes_inserted == 0
+    assert result.notes_skipped == 0
+    svc.store.insert_note.assert_not_called()
+
+
+def test_dedup_midband_llm_says_keep(tmp_path: Path) -> None:
+    """Mid-band note classified KEEP by LLM is inserted."""
+    dist = (BOOTSTRAP_DEDUP_DIST + BOOTSTRAP_DEDUP_MIDBAND) / 2
+    svc = _make_service_mock(nearest_dist=dist, llm_verdict="KEEP")
+    md = _write_md(tmp_path, "- AWS (API Gateway, DynamoDB, Step Functions, Lambda)\n")
+
+    result = bootstrap_from_markdown(service=svc, file_path=md, source="test")
+
+    assert result.notes_inserted == 1
+    assert result.notes_llm_deduped == 0
+    svc.store.insert_note.assert_called_once()
+
+
+def test_dedup_midband_llm_error_falls_back_to_keep(tmp_path: Path) -> None:
+    """LLM exception in mid-band check falls back to inserting (never silently drops)."""
+    dist = (BOOTSTRAP_DEDUP_DIST + BOOTSTRAP_DEDUP_MIDBAND) / 2
+    svc = _make_service_mock(nearest_dist=dist)
+    svc.llm.complete.side_effect = RuntimeError("API down")
+    md = _write_md(tmp_path, "- Works with AWS services\n")
+
+    result = bootstrap_from_markdown(service=svc, file_path=md, source="test")
+
+    assert result.notes_inserted == 1
+    assert result.notes_llm_deduped == 0
+
+
+def test_dedup_midband_upper_boundary_no_llm(tmp_path: Path) -> None:
+    """A note at exactly BOOTSTRAP_DEDUP_MIDBAND is inserted without LLM."""
+    svc = _make_service_mock(nearest_dist=BOOTSTRAP_DEDUP_MIDBAND)
+    md = _write_md(tmp_path, "- Enjoys cooking and baking at home\n")
+
+    result = bootstrap_from_markdown(service=svc, file_path=md, source="test")
+
+    assert result.notes_inserted == 1
+    svc.llm.complete.assert_not_called()
+
+
+def test_bootstrap_result_fields() -> None:
+    """BootstrapResult dataclass exposes all counter fields, defaulting to 0."""
     r = BootstrapResult(episode_id="x", notes_inserted=3, profile_updates=1)
     assert r.notes_skipped == 0
+    assert r.notes_llm_deduped == 0

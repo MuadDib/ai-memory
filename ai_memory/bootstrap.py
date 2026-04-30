@@ -30,6 +30,7 @@ from uuid import uuid4
 
 from ai_memory.core.models import Episode, Note, Profile, Turn
 from ai_memory.core.service import MemoryService
+from ai_memory.llm.interface import Message
 from ai_memory.timestamps import now_iso
 
 logger = logging.getLogger(__name__)
@@ -44,11 +45,31 @@ _PROFILE_KEY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 
-# Notes whose nearest existing neighbour is closer than this are skipped as
-# duplicates. Higher than Phase 4's DUPLICATE_DIST_BELOW (0.20) because
-# bootstrap facts are short and clean — "Name: Igor" vs "Name: Igor Valjevic"
-# sits at ~0.24 and is clearly the same fact.
+# --- Dedup thresholds -------------------------------------------------------
+#
+# Bootstrap uses a two-tier dedup strategy:
+#
+#   dist < BOOTSTRAP_DEDUP_DIST         → skip without LLM (obvious duplicate)
+#   BOOTSTRAP_DEDUP_DIST <= dist < BOOTSTRAP_DEDUP_MIDBAND → ask LLM
+#   dist >= BOOTSTRAP_DEDUP_MIDBAND     → insert (clearly different)
+#
+# BOOTSTRAP_DEDUP_DIST is higher than Phase 4's DUPLICATE_DIST_BELOW (0.20)
+# because bootstrap facts are short and clean — "Name: Igor" vs
+# "Name: Igor Valjevic" sits at ~0.24 and is clearly the same fact.
+#
+# The mid-band LLM check catches semantically identical but differently-worded
+# facts, e.g. "Role: C# programmer and team lead" vs
+# "Role: Senior Software Developer, Team Lead, Architect (Citywire)" at 0.351.
 BOOTSTRAP_DEDUP_DIST = 0.30
+BOOTSTRAP_DEDUP_MIDBAND = 0.40
+
+_BOOTSTRAP_DEDUP_SYSTEM = (
+    "You are a memory deduplication assistant. You will be given two short "
+    "facts about the same person. Reply with exactly one word: DUPLICATE if "
+    "they describe the same underlying fact (even if worded differently or "
+    "one is a subset of the other), or KEEP if they are genuinely distinct "
+    "and both worth remembering. No explanation."
+)
 
 
 @dataclass
@@ -57,6 +78,7 @@ class BootstrapResult:
     notes_inserted: int
     profile_updates: int
     notes_skipped: int = 0
+    notes_llm_deduped: int = 0
 
 
 def bootstrap_from_markdown(
@@ -107,6 +129,7 @@ def bootstrap_from_markdown(
     # Walk bullets
     notes_inserted = 0
     notes_skipped = 0
+    notes_llm_deduped = 0
     profile_updates = 0
     seen_hashes: set[str] = set()
 
@@ -128,18 +151,27 @@ def bootstrap_from_markdown(
         # Always also store as a note so it's searchable
         [embedding] = service.embedder.embed([bullet])
 
-        # Cross-file dedup: skip if a near-identical note already exists.
+        # Cross-file dedup — two-tier:
+        #   tier 1: dist < BOOTSTRAP_DEDUP_DIST  → skip immediately (obvious dup)
+        #   tier 2: dist in mid-band             → ask LLM for a binary verdict
         neighbours = service.store.search_notes_vector(embedding, k=1, only_valid=True)
-        if neighbours and neighbours[0][1] < BOOTSTRAP_DEDUP_DIST:
-            existing = neighbours[0][0]
-            logger.debug(
-                "Bootstrap: skipping near-duplicate of %s (dist=%.3f): %r",
-                existing.id[:8],
-                neighbours[0][1],
-                bullet[:60],
-            )
-            notes_skipped += 1
-            continue
+        if neighbours:
+            nearest, dist = neighbours[0][0], neighbours[0][1]
+            if dist < BOOTSTRAP_DEDUP_DIST:
+                logger.debug(
+                    "Bootstrap: skipping near-duplicate of %s (dist=%.3f): %r",
+                    nearest.id[:8], dist, bullet[:60],
+                )
+                notes_skipped += 1
+                continue
+            if dist < BOOTSTRAP_DEDUP_MIDBAND:
+                if _llm_is_duplicate(service, bullet, nearest.text):
+                    logger.debug(
+                        "Bootstrap LLM: skipping mid-band duplicate of %s (dist=%.3f): %r vs %r",
+                        nearest.id[:8], dist, bullet[:60], nearest.text[:60],
+                    )
+                    notes_llm_deduped += 1
+                    continue
 
         note = Note(
             id=str(uuid4()),
@@ -154,10 +186,12 @@ def bootstrap_from_markdown(
         notes_inserted += 1
 
     logger.info(
-        "Bootstrap complete from %s: %d notes inserted, %d skipped (near-duplicate), %d profile updates",
+        "Bootstrap complete from %s: %d notes inserted, %d skipped (near-duplicate), "
+        "%d skipped (LLM mid-band dedup), %d profile updates",
         file_path,
         notes_inserted,
         notes_skipped,
+        notes_llm_deduped,
         profile_updates,
     )
     return BootstrapResult(
@@ -165,7 +199,34 @@ def bootstrap_from_markdown(
         notes_inserted=notes_inserted,
         profile_updates=profile_updates,
         notes_skipped=notes_skipped,
+        notes_llm_deduped=notes_llm_deduped,
     )
+
+
+# --- LLM dedup helper -------------------------------------------------------
+
+def _llm_is_duplicate(service: MemoryService, new_fact: str, existing_fact: str) -> bool:
+    """Ask the LLM whether `new_fact` and `existing_fact` are the same fact.
+
+    Returns True if they are duplicates (new_fact should be skipped).
+    Falls back to False on any error so we never silently drop facts.
+    """
+    try:
+        completion = service.llm.complete(
+            system=_BOOTSTRAP_DEDUP_SYSTEM,
+            messages=[
+                Message(
+                    role="user",
+                    content=f"EXISTING: {existing_fact}\nNEW: {new_fact}",
+                )
+            ],
+            max_tokens=5,
+        )
+        verdict = completion.text.strip().upper()
+        return verdict.startswith("DUPLICATE")
+    except Exception as exc:
+        logger.warning("Bootstrap LLM dedup failed (keeping both): %s", exc)
+        return False
 
 
 # --- Markdown helpers -------------------------------------------------------
