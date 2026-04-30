@@ -45,14 +45,12 @@ These are listed in proposal v3 + v4:
 
 ## Open follow-ups (priority order)
 
-1. **`ai-memory redream --episode <id> [--purge-notes]` admin subcommand** — productise the reset-and-redream recipe. Support `--all-pending` and `--latest` too.
-2. **Auto-upgrade to `gpt-4o` for long episodes** — Phase 4 quality looks model-bound. Per-call escalation rule based on turn count or token estimate.
-3. **Pre-render redaction** — privacy filter runs before persistence, but the assembled transcript still has raw creds when sent to OpenAI for dream cycles.
-4. **Expand eval suite** — add dedup quality and promotion quality cases; currently 17 recall cases only.
-5. **Phase 5 promotion quality** — PROMOTION_SYSTEM still occasionally promotes facts *about* external entities (e.g. British Gas) rather than facts about Igor. Prompt tightening + eval cases.
-6. **Bootstrap entity backfill** — 93 bootstrap notes have zero entities. Either run a one-off entity extraction pass or add entity extraction to bootstrap ingest.
+1. **Pre-render redaction** — privacy filter runs before persistence, but the assembled transcript still has raw creds when sent to OpenAI for dream cycles.
+2. **Phase 4 contradiction detection** — `invalidated` count is low; the mid-band LLM verdict prompt needs more signal for genuine contradictions. Needs eval cases.
+3. **`ai-memory redream --all` with confirmation gate** — current `--all-pending` re-dreams unconsolidated episodes; a separate `--all` that resets ALL episodes is missing.
+4. **Cross-encoder rerank** — currently pure RRF; adding a lightweight cross-encoder as a final rerank step would improve top-k precision.
 
-Done: eval harness (17/17 passing); Phase 5 fix; tag taxonomy redesign (9 domain tags + entities); bootstrap nesting fix; corpus reset + redream; Phase 4 dedup threshold 0.10→0.20 + DUPLICATE-biased verdict prompt; Phase 4 contradiction detection prompt rewrite + explicit equivalent-naming exclusion; Pydantic output validation + retry (`_llm_call_with_retry`); bootstrap cross-file dedup (two-tier: vector threshold 0.30 + mid-band LLM check up to 0.40).
+Done: eval harness (27/27 passing); Phase 5 promotion prompt fix (external-entity guard + bad profile cleanup); bootstrap cross-file dedup (two-tier: 0.30 vector + mid-band LLM check up to 0.40 + mid-band LLM dedup); `backfill-entities` CLI subcommand (bootstrap entity backfill done: 41/89 notes now have entities); `redream` CLI subcommand (--episode, --latest, --all-pending, --keep-notes); auto-upgrade to gpt-4o for long episodes (>= 100 turns, Phase 3 only); eval suite expanded 17→27 cases (dedup regression + promotion quality + personal/technical breadth); Phase 4 dedup threshold 0.10→0.20 + DUPLICATE-biased verdict prompt; Pydantic output validation + retry; tag taxonomy redesign; bootstrap nesting fix; corpus reset + redream.
 
 Still pending from earlier: incremental Phase 3 dreaming, `remember --from-stdin`, cross-encoder rerank, local sentence-transformers embedder, Linux daemon mode.
 
