@@ -132,7 +132,7 @@ class MemoryService:
         )
 
     def upsert_profile(self, key: str, value: str, source: str | None = None) -> None:
-        """Insert / update a Tier 0 profile fact and re-mirror to profile.md."""
+        """Insert / update a profile fact and re-mirror to profile.md."""
         self.store.upsert_profile(
             Profile(key=key, value=value, updated_at=now_iso(), source=source)
         )
@@ -148,7 +148,7 @@ class MemoryService:
         return self.store.list_recent_episodes(limit)
 
     def add_note(self, *, text: str, tags: list[str] | None = None) -> str:
-        """Insert a Tier 1 note directly (used by bootstrap; dreaming uses this too)."""
+        """Insert a note directly (used by bootstrap; dreaming uses this too)."""
         now = now_iso()
         [embedding] = self.embedder.embed([text])
         note = Note(

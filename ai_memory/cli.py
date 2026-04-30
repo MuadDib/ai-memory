@@ -137,7 +137,7 @@ def recall(config, query, depth, k):
 @main.command()
 @click.pass_obj
 def profile(config):
-    """Print the current Tier 0 profile."""
+    """Print the current profile."""
     service = MemoryService.build(config)
     service.start()
     try:
@@ -244,7 +244,7 @@ def stats(config):
               help="If set, only import the matching session id. Useful for testing.")
 @click.pass_obj
 def import_cowork(config, root_path, include_tools, session_id):
-    """Bulk-import past Cowork / Claude Code chat transcripts into Tier 3.
+    """Bulk-import past Cowork / Claude Code chat transcripts as turns.
 
     Each session becomes one Episode + many Turn rows. Re-runnable: sessions
     that already have a matching episode id are skipped. The dream cycle

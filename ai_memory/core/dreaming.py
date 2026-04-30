@@ -7,7 +7,7 @@ This is the heavy LLM pipeline that turns raw turns into clean memory:
                           episode per write-side group; refinement deferred)
     Phase 3 — CONSOLIDATE (LLM summarises episodes, extracts atomic facts)
     Phase 4 — INTEGRATE  (dedupe via vector + LLM, contradict-resolution, link)
-    Phase 5 — PROMOTE    (recurring patterns -> Tier 0 profile)
+    Phase 5 — PROMOTE    (recurring patterns -> profile)
     Phase 6 — DECAY/PRUNE (soft-delete stale notes)
     Phase 7 — JOURNAL    (write dream_log entry)
 
@@ -491,7 +491,7 @@ def _insert_candidate(
     now: str,
     contradicts: List[str] | None = None,
 ) -> str:
-    """Persist a candidate as a new Tier 1 note. Returns the new note id."""
+    """Persist a candidate as a new note. Returns the new note id."""
     note = Note(
         id=str(uuid4()),
         text=cand.text,
@@ -517,7 +517,7 @@ def _phase5_promote(
     now: str,
     journal: List[str],
 ) -> Tuple[int, int]:
-    """Find recurring fact clusters and promote them to Tier 0 profile.
+    """Find recurring fact clusters and promote them to the profile.
 
     Returns (promotions_count, llm_tokens_used).
     """

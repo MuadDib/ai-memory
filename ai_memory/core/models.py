@@ -35,7 +35,7 @@ KnownSource = Literal[
 
 @dataclass
 class Profile:
-    """Tier 0 — durable user/agent fact.
+    """Profile — durable user/agent fact.
 
     Stored as a key/value row plus mirrored into `profile.md` on update.
     """
@@ -48,7 +48,7 @@ class Profile:
 
 @dataclass
 class Note:
-    """Tier 1 — atomic semantic fact.
+    """Note — atomic semantic fact.
 
     Bi-temporal: `valid_from` / `valid_to` track when this fact held.
     `superseded_by` points at the note that replaced this one (if any).
@@ -73,7 +73,7 @@ class Note:
 
 @dataclass
 class Episode:
-    """Tier 2 — per-session summary."""
+    """Episode — per-session summary."""
 
     id: str
     title: str
@@ -88,7 +88,7 @@ class Episode:
 
 @dataclass
 class Turn:
-    """Tier 3 — verbatim raw turn, indexed by byte offset into a JSONL file."""
+    """Turn — verbatim raw turn, indexed by byte offset into a JSONL file."""
 
     id: str
     episode_id: str

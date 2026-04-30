@@ -109,8 +109,8 @@ def build_app(service: MemoryService) -> FastMCP:
     async def memory_recall(query: str, depth: str = "deep", k: int = 8) -> list[dict]:
         """Retrieve relevant memories.
 
-        Always returns a merged ranking across atomic notes (Tier 1) and
-        episode summaries (Tier 2). `depth` only controls whether to also
+        Always returns a merged ranking across atomic notes and
+        episode summaries. `depth` only controls whether to also
         expand into raw conversation turns:
 
             - "fast" / "deep" -> notes + episode summaries (no raw turns)
@@ -119,7 +119,7 @@ def build_app(service: MemoryService) -> FastMCP:
                                  — use only when you need exact wording.
 
         The fast/deep distinction was originally a tier-gate, but we found
-        that gating tier 2 behind a heuristic mis-fired with small corpora
+        that gating episode summaries behind a heuristic mis-fired with small corpora
         and tight embedding score distributions. Now they're identical.
         """
         with _timed_tool("memory_recall", depth=depth, k=k):
@@ -159,7 +159,7 @@ def build_app(service: MemoryService) -> FastMCP:
 
     @app.resource("memory://profile")
     def profile_resource() -> str:
-        """The user's Tier 0 profile, as a human-readable markdown blob.
+        """The user's profile, as a human-readable markdown blob.
 
         Clients should attach this to context at session start so the agent
         knows who they're talking to.

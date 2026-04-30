@@ -3,8 +3,8 @@ Recall pipeline: hybrid search (BM25 + vector) fused with Reciprocal Rank Fusion
 soft-boosted by recency.
 
 Three depths:
-    - "fast"     -> Tier 0 (profile) + top-k Tier 1 notes
-    - "deep"     -> larger Tier 1 + Tier 2 sweep, scored together
+    - "fast"     -> profile + top-k notes
+    - "deep"     -> larger notes + episode sweep, scored together
     - "verbatim" -> deep + then fetch verbatim turns for the top hits
 
 RRF formula:

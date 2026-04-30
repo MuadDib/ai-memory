@@ -17,7 +17,7 @@ from ai_memory.core.models import CoworkImportState, DreamLog, Episode, Note, Pr
 class MemoryStore(Protocol):
     """Storage backend for indexed memory data.
 
-    Raw transcripts (Tier 3 file content) live behind `RawTranscriptStore`,
+    Raw transcripts (verbatim turn file content) live behind `RawTranscriptStore`,
     not here — this Protocol is for indexed/queryable rows only.
     """
 
@@ -29,7 +29,7 @@ class MemoryStore(Protocol):
     def close(self) -> None:
         """Release any held connections."""
 
-    # --- Profile (Tier 0) ------------------------------------------------
+    # --- Profile ---------------------------------------------------------
 
     def upsert_profile(self, profile: Profile) -> None: ...
 
@@ -37,7 +37,7 @@ class MemoryStore(Protocol):
 
     def list_profile(self) -> list[Profile]: ...
 
-    # --- Notes (Tier 1) --------------------------------------------------
+    # --- Notes -----------------------------------------------------------
 
     def insert_note(self, note: Note, embedding: list[float]) -> None: ...
 
@@ -66,7 +66,7 @@ class MemoryStore(Protocol):
     def get_note_embedding(self, note_id: str) -> list[float] | None:
         """Fetch the stored embedding for a note (used by clustering against existing rows)."""
 
-    # --- Episodes (Tier 2) ----------------------------------------------
+    # --- Episodes --------------------------------------------------------
 
     def insert_episode(self, episode: Episode, embedding: list[float] | None = None) -> None: ...
 
@@ -85,7 +85,7 @@ class MemoryStore(Protocol):
 
     def mark_episode_consolidated(self, episode_id: str, when: int) -> None: ...
 
-    # --- Turns (Tier 3 index) -------------------------------------------
+    # --- Turns -----------------------------------------------------------
 
     def insert_turn(self, turn: Turn) -> None: ...
 

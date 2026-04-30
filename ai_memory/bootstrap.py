@@ -11,9 +11,9 @@ Strategy:
     - Treat each input file as one synthetic episode (source = chatgpt-export
       or claude-export). Raw markdown is preserved to disk in `exports/` and
       indexed as a single Turn for verbatim recall.
-    - Walk the markdown bullets and create one Tier 1 note per bullet — these
+    - Walk the markdown bullets and create one note per bullet — these
       are already-atomic facts, so we skip the LLM consolidation pass.
-    - Promote the obvious identity bullets (name, location, role) to Tier 0.
+    - Promote the obvious identity bullets (name, location, role) to the profile.
 
 Idempotent: re-running with the same files updates rather than duplicates,
 keyed on a stable hash of (file path, bullet text).
@@ -34,7 +34,7 @@ from ai_memory.timestamps import now_iso
 
 logger = logging.getLogger(__name__)
 
-# Bullet keys we automatically promote to Tier 0 profile if found.
+# Bullet keys we automatically promote to the profile if found.
 _PROFILE_KEY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("name", re.compile(r"^name[:\-]\s*(.+)$", re.IGNORECASE)),
     ("location", re.compile(r"^location[:\-]\s*(.+)$", re.IGNORECASE)),
@@ -116,7 +116,7 @@ def bootstrap_from_markdown(
                 promoted = True
                 break
 
-        # Always also store as a Tier 1 note so it's searchable
+        # Always also store as a note so it's searchable
         [embedding] = service.embedder.embed([bullet])
         note = Note(
             id=str(uuid4()),
