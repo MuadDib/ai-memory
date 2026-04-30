@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from ulid import ULID
+from uuid import uuid4
 
 from ai_memory.config import Config, ensure_home_layout
 from ai_memory.core import dreaming as _dreaming
@@ -152,7 +152,7 @@ class MemoryService:
         now = now_iso()
         [embedding] = self.embedder.embed([text])
         note = Note(
-            id=str(ULID()),
+            id=str(uuid4()),
             text=text,
             tags=tags or [],
             valid_from=now,

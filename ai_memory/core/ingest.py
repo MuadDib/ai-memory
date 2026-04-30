@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timezone
 
-from ulid import ULID
+from uuid import uuid4
 
 from ai_memory.core.models import Episode, Turn
 from ai_memory.privacy import redact
@@ -68,7 +68,7 @@ def remember(
 
     # Append to raw file
     payload = {
-        "id": str(ULID()),
+        "id": str(uuid4()),
         "role": role,
         "ts": now,
         "text": safe_text,
@@ -106,7 +106,7 @@ def _find_or_open_episode(store: "MemoryStore", source: str, now: str) -> str:
             continue
         return ep.id
 
-    new_id = str(ULID())
+    new_id = str(uuid4())
     episode = Episode(
         id=new_id,
         title="",  # populated by dream cycle

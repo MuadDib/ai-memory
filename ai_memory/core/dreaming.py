@@ -30,7 +30,7 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterable, List, Tuple
 
-from ulid import ULID
+from uuid import uuid4
 
 from ai_memory.config import DreamConfig
 from ai_memory.core.models import DreamLog, Note, Profile
@@ -194,7 +194,7 @@ def dream(
 ) -> DreamReport:
     """Run a single dream pass. Inserts a DreamLog row and returns a report."""
     now = now if now is not None else now_iso()
-    log_id = str(ULID())
+    log_id = str(uuid4())
 
     log = DreamLog(id=log_id, started_at=now, trigger=request.trigger)
     store.insert_dream_log(log)
@@ -493,7 +493,7 @@ def _insert_candidate(
 ) -> str:
     """Persist a candidate as a new Tier 1 note. Returns the new note id."""
     note = Note(
-        id=str(ULID()),
+        id=str(uuid4()),
         text=cand.text,
         tags=cand.tags,
         source_episode_ids=[cand.source_episode_id] if cand.source_episode_id else [],
