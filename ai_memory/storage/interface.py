@@ -92,6 +92,16 @@ class MemoryStore(Protocol):
 
     def mark_episode_consolidated(self, episode_id: str, when: int) -> None: ...
 
+    def reset_episode_for_redream(self, episode_id: str, purge_notes: bool = True) -> int:
+        """Reset an episode so the dream cycle will reprocess it.
+
+        Sets consolidated_at = NULL on the episode.  When `purge_notes` is
+        True (default) also hard-deletes every note whose source_episode_ids
+        contains this episode id, removing it from the FTS and vector indexes
+        too.  Returns the number of notes deleted.
+        """
+        ...
+
     # --- Turns -----------------------------------------------------------
 
     def insert_turn(self, turn: Turn) -> None: ...

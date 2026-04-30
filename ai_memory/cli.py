@@ -135,6 +135,97 @@ def recall(config, query, depth, k):
 
 
 @main.command()
+@click.option("--episode", "episode_ids", multiple=True,
+              help="Episode ID (or unambiguous prefix) to reset and re-dream. Repeatable.")
+@click.option("--latest", is_flag=True,
+              help="Reset and re-dream the most recently consolidated episode.")
+@click.option("--all-pending", is_flag=True,
+              help="Re-dream all episodes not yet consolidated (no reset needed; just runs dream).")
+@click.option("--keep-notes", is_flag=True,
+              help="Reset consolidated_at without deleting extracted notes. "
+                   "Notes from the re-dream will accumulate alongside old ones; "
+                   "Phase 4 dedup will merge them. Default is to purge notes first.")
+@click.option("--trigger", default="manual",
+              type=click.Choice(["manual", "scheduled", "idle", "pressure"]))
+@click.pass_obj
+def redream(config, episode_ids, latest, all_pending, keep_notes, trigger):
+    """Reset one or more episodes and re-run the dream cycle on them.
+
+    Useful for prompt iteration: after tweaking EXTRACT_SYSTEM or
+    INTEGRATE_VERDICT_SYSTEM, run redream to regenerate notes from scratch.
+
+    Examples:\n
+      ai-memory redream --latest\n
+      ai-memory redream --episode 3d275d78\n
+      ai-memory redream --episode abc123 --episode def456\n
+      ai-memory redream --all-pending
+    """
+    if not episode_ids and not latest and not all_pending:
+        raise click.UsageError(
+            "Specify at least one of --episode, --latest, or --all-pending."
+        )
+
+    service = MemoryService.build(config)
+    service.start()
+    try:
+        purge = not keep_notes
+
+        if all_pending:
+            # Just run dream — episodes already have consolidated_at = NULL
+            click.echo("Running dream on all pending episodes (no reset)...")
+        else:
+            # Resolve episode IDs
+            targets: list[str] = []
+
+            if latest:
+                all_eps = service.store.list_recent_episodes(limit=100)
+                consolidated = [ep for ep in all_eps if ep.consolidated_at]
+                if not consolidated:
+                    raise click.ClickException("No consolidated episodes found.")
+                # list_recent_episodes returns most-recent first
+                targets.append(consolidated[0].id)
+
+            for partial_id in episode_ids:
+                all_eps = service.store.list_recent_episodes(limit=500)
+                matches = [ep for ep in all_eps if ep.id.startswith(partial_id)]
+                if not matches:
+                    raise click.ClickException(
+                        f"No episode found with id prefix {partial_id!r}."
+                    )
+                if len(matches) > 1:
+                    ids = ", ".join(m.id for m in matches)
+                    raise click.ClickException(
+                        f"Ambiguous prefix {partial_id!r} matches {len(matches)} episodes: {ids}"
+                    )
+                targets.append(matches[0].id)
+
+            # Deduplicate while preserving order
+            seen: set[str] = set()
+            targets = [t for t in targets if not (t in seen or seen.add(t))]  # type: ignore[func-returns-value]
+
+            for ep_id in targets:
+                ep = service.store.get_episode(ep_id)
+                label = (ep.title or ep_id[:12]) if ep else ep_id[:12]
+                deleted = service.store.reset_episode_for_redream(ep_id, purge_notes=purge)
+                if purge:
+                    click.echo(f"Reset {ep_id[:12]}  ({label})  — {deleted} notes purged")
+                else:
+                    click.echo(f"Reset {ep_id[:12]}  ({label})  — notes kept")
+
+        # Run dream
+        report = service.dream(trigger=trigger)
+        click.echo(
+            f"\ndream {report.log_id}: episodes={report.episodes_processed} "
+            f"notes_added={report.notes_added} pruned={report.notes_pruned}"
+        )
+        click.echo("--- journal ---")
+        click.echo(report.journal)
+
+    finally:
+        service.stop()
+
+
+@main.command()
 @click.pass_obj
 def profile(config):
     """Print the current profile."""

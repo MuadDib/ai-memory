@@ -599,6 +599,38 @@ class SqliteStore:
             )
             self.conn.commit()
 
+    def reset_episode_for_redream(self, episode_id: str, purge_notes: bool = True) -> int:
+        """Reset episode so the dream cycle reprocesses it.
+
+        Returns the number of notes deleted (0 if purge_notes=False).
+        """
+        deleted = 0
+        with self._lock:
+            if purge_notes:
+                # Find note rowids first (need rowid for FTS delete)
+                pattern = f"%{episode_id}%"
+                note_rows = self.conn.execute(
+                    "SELECT id, rowid FROM notes WHERE source_episode_ids LIKE ?",
+                    (pattern,),
+                ).fetchall()
+                for note_id, rowid in note_rows:
+                    self.conn.execute(
+                        "DELETE FROM notes_vec WHERE note_id = ?", (note_id,)
+                    )
+                    self.conn.execute(
+                        "DELETE FROM notes_fts WHERE rowid = ?", (rowid,)
+                    )
+                self.conn.execute(
+                    "DELETE FROM notes WHERE source_episode_ids LIKE ?", (pattern,)
+                )
+                deleted = len(note_rows)
+            self.conn.execute(
+                "UPDATE episodes SET consolidated_at = NULL WHERE id = ?",
+                (episode_id,),
+            )
+            self.conn.commit()
+        return deleted
+
     # --- Turns -----------------------------------------------------------
 
     def insert_turn(self, turn: Turn) -> None:
