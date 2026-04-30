@@ -373,3 +373,36 @@ def test_llm_call_with_retry_passes_error_context_to_second_call() -> None:
     assert retry_messages[1]["content"] == "bad output"
     assert retry_messages[2]["role"] == "user"
     assert "invalid" in retry_messages[2]["content"].lower()
+
+
+# --- Verdict parsing edge cases ---------------------------------------------
+
+
+def test_parse_verdicts_valid_all_four_types() -> None:
+    """All four verdict values should parse cleanly."""
+    for verdict in ("DUPLICATE", "CONTRADICTS", "COMPLEMENTS", "UNRELATED"):
+        raw = f'[{{"existing_id": "x", "verdict": "{verdict}", "reason": "ok"}}]'
+        result = _parse_verdicts(raw)
+        assert len(result) == 1
+        assert result[0].verdict == verdict
+
+
+def test_parse_verdicts_missing_reason_field_is_ok() -> None:
+    """reason is optional — should not cause a ValidationError."""
+    raw = '[{"existing_id": "abc", "verdict": "DUPLICATE"}]'
+    result = _parse_verdicts(raw)
+    assert result[0].reason == ""
+
+
+def test_parse_verdicts_case_sensitive_enum() -> None:
+    """Lowercase verdict values are invalid and skipped."""
+    raw = '[{"existing_id": "x", "verdict": "duplicate"}]'
+    with pytest.raises(ValueError):
+        _parse_verdicts(raw)
+
+
+def test_parse_promotion_null_string_decoded_as_none() -> None:
+    """JSON null literal → PromotionResult with key=None (decline signal)."""
+    result = _parse_promotion("null")
+    assert result.key is None
+    assert result.value is None

@@ -71,3 +71,52 @@ cases:
     k: 8
     depth: deep
     tags: [system, dream]
+
+  - id: user-location
+    query: "where does Igor live"
+    expected: "London"
+    k: 8
+    depth: fast
+    tags: [profile, personal]
+
+  - id: user-role
+    query: "what is Igor's job title and company"
+    expected: "Citywire"
+    k: 8
+    depth: fast
+    tags: [profile, personal]
+
+  - id: preferred-db
+    query: "what database does Igor prefer for relational data"
+    expected: "PostgreSQL"
+    k: 8
+    depth: fast
+    tags: [preference, technical]
+
+  - id: frontend-framework
+    query: "which frontend framework does Igor use"
+    expected: "Angular"
+    k: 8
+    depth: fast
+    tags: [preference, technical]
+
+  - id: murphy-bed
+    query: "tell me about Igor's Murphy bed project"
+    expected: "Murphy"
+    k: 8
+    depth: fast
+    tags: [project, personal]
+
+  - id: communication-style
+    query: "how does Igor prefer to receive answers"
+    expected: "direct"
+    k: 8
+    depth: fast
+    tags: [preference]
+
+  - id: search-fusion
+    query: "how are vector and keyword search results combined"
+    expected: "Reciprocal Rank Fusion"
+    k: 8
+    depth: fast
+    tags: [system, recall]
