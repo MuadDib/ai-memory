@@ -287,5 +287,119 @@ def import_cowork(config, root_path, include_tools, session_id):
         service.stop()
 
 
+@main.command()
+@click.option("--suite", "suite_path", type=click.Path(path_type=Path), default=None,
+              help="Path to a YAML eval suite. Defaults to evals/default.yaml in the repo root.")
+@click.option("--k", default=None, type=int,
+              help="Override k for all cases (per-case k in YAML wins if set).")
+@click.option("--depth", default=None, type=click.Choice(["fast", "deep", "verbatim"]),
+              help="Override depth for all cases.")
+@click.option("--run-id", default=None,
+              help="Stable run identifier (UUID). Defaults to a fresh UUID4 per invocation.")
+@click.option("--no-persist", is_flag=True,
+              help="Skip writing results to the eval_results table.")
+@click.pass_obj
+def eval(config, suite_path, k, depth, run_id, no_persist):
+    """Run the recall eval suite and report recall@k.
+
+    Exits 0 if all cases pass, 1 if any case fails — suitable for CI gates.
+    """
+    import sqlite3 as _sqlite3
+    from uuid import uuid4
+    from ai_memory.eval import load_suite, run_suite
+    from ai_memory.core.models import EvalResult
+    from ai_memory.timestamps import now_iso
+
+    # --- Resolve suite path -------------------------------------------------
+    if suite_path is None:
+        # Try repo-relative first, then $AI_MEMORY_HOME/evals/
+        repo_default = Path(__file__).parent.parent / "evals" / "default.yaml"
+        home_default = config.home / "evals" / "default.yaml"
+        if repo_default.exists():
+            suite_path = repo_default
+        elif home_default.exists():
+            suite_path = home_default
+        else:
+            raise click.UsageError(
+                f"No suite found at {repo_default} or {home_default}. "
+                "Pass --suite <path> to specify one explicitly."
+            )
+
+    suite = load_suite(suite_path)
+    run_id = run_id or str(uuid4())
+
+    service = MemoryService.build(config)
+    service.start()
+
+    results: list[EvalResult] = []
+    case_width = max((len(c.id) for c in suite.cases), default=20)
+
+    try:
+        for cr in run_suite(suite, service, k_override=k, depth_override=depth):
+            status = "PASS" if cr.passed else "FAIL"
+            effective_k = k if k is not None else cr.case.k
+            effective_depth = depth if depth is not None else cr.case.depth
+            click.echo(
+                f"{status}  [{effective_depth} k={effective_k:2d} {cr.latency_ms:4d}ms]"
+                f"  {cr.case.id:{case_width}s}  {cr.case.query[:60]}"
+            )
+
+            er = EvalResult(
+                id=str(uuid4()),
+                run_id=run_id,
+                suite=suite.suite,
+                case_id=cr.case.id,
+                query=cr.case.query,
+                expected=cr.case.expected,
+                k=effective_k,
+                depth=effective_depth,
+                passed=cr.passed,
+                hits_count=cr.hits_count,
+                top_hit_text=(cr.top_hit_text or "")[:500] if cr.top_hit_text else None,
+                latency_ms=cr.latency_ms,
+                run_at=now_iso(),
+            )
+            results.append(er)
+
+    finally:
+        service.stop()
+
+    # --- Persist ------------------------------------------------------------
+    if not no_persist and results:
+        conn = _sqlite3.connect(config.database_path)
+        for er in results:
+            conn.execute(
+                "INSERT INTO eval_results("
+                "  id,run_id,suite,case_id,query,expected,"
+                "  k,depth,passed,hits_count,top_hit_text,latency_ms,run_at"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    er.id, er.run_id, er.suite, er.case_id, er.query, er.expected,
+                    er.k, er.depth, int(er.passed), er.hits_count,
+                    er.top_hit_text, er.latency_ms, er.run_at,
+                ),
+            )
+        conn.commit()
+        conn.close()
+
+    # --- Summary ------------------------------------------------------------
+    passed = sum(1 for r in results if r.passed)
+    total = len(results)
+    pct = 100.0 * passed / total if total else 0.0
+
+    click.echo()
+    click.echo("--- eval summary ---")
+    click.echo(f"suite:     {suite.suite}  ({total} cases)")
+    click.echo(f"run_id:    {run_id}")
+    click.echo(f"passed:    {passed} / {total}")
+    click.echo(f"recall@k:  {pct:.1f}%")
+    if not no_persist and results:
+        click.echo(f"persisted: {config.database_path.name}::eval_results")
+    else:
+        click.echo("(not persisted)")
+
+    sys.exit(0 if passed == total else 1)
+
+
 if __name__ == "__main__":
     main()

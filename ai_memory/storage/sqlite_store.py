@@ -20,7 +20,7 @@ from typing import Any
 
 import sqlite_vec
 
-from ai_memory.core.models import CoworkImportState, DreamLog, Episode, Note, Profile, Turn
+from ai_memory.core.models import CoworkImportState, DreamLog, Episode, EvalResult, Note, Profile, Turn
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -110,9 +110,28 @@ CREATE TABLE IF NOT EXISTS cowork_import_state (
   last_byte_offset  INTEGER NOT NULL,
   last_imported_at  TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS eval_results (
+  id            TEXT PRIMARY KEY,   -- UUID4 per row
+  run_id        TEXT NOT NULL,      -- UUID4 shared across one CLI invocation
+  suite         TEXT NOT NULL,
+  case_id       TEXT NOT NULL,
+  query         TEXT NOT NULL,
+  expected      TEXT NOT NULL,
+  k             INTEGER NOT NULL,
+  depth         TEXT NOT NULL,
+  passed        INTEGER NOT NULL,   -- 1 = pass, 0 = fail
+  hits_count    INTEGER NOT NULL,
+  top_hit_text  TEXT,
+  latency_ms    INTEGER NOT NULL,
+  run_at        TEXT NOT NULL       -- ISO 8601 UTC
+);
+
+CREATE INDEX IF NOT EXISTS eval_results_run_id  ON eval_results(run_id);
+CREATE INDEX IF NOT EXISTS eval_results_case_id ON eval_results(case_id, run_at);
 """
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Migration SQL run once when upgrading from schema version 1 (Unix int
 # timestamps) to version 2 (ISO 8601 UTC strings).  The WHERE guards make
@@ -161,6 +180,30 @@ UPDATE dream_log
 UPDATE cowork_import_state
    SET last_imported_at = REPLACE(datetime(CAST(last_imported_at AS INTEGER), 'unixepoch'), ' ', 'T') || 'Z'
  WHERE last_imported_at NOT LIKE '%T%';
+"""
+
+
+# Migration SQL run once when upgrading from schema version 2 to version 3.
+# Adds the eval_results table to existing databases; idempotent via IF NOT EXISTS.
+_MIGRATION_V2_TO_V3 = """
+CREATE TABLE IF NOT EXISTS eval_results (
+  id            TEXT PRIMARY KEY,
+  run_id        TEXT NOT NULL,
+  suite         TEXT NOT NULL,
+  case_id       TEXT NOT NULL,
+  query         TEXT NOT NULL,
+  expected      TEXT NOT NULL,
+  k             INTEGER NOT NULL,
+  depth         TEXT NOT NULL,
+  passed        INTEGER NOT NULL,
+  hits_count    INTEGER NOT NULL,
+  top_hit_text  TEXT,
+  latency_ms    INTEGER NOT NULL,
+  run_at        TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS eval_results_run_id  ON eval_results(run_id);
+CREATE INDEX IF NOT EXISTS eval_results_case_id ON eval_results(case_id, run_at);
 """
 
 
@@ -234,6 +277,8 @@ class SqliteStore:
         current_version = current["v"] if current and current["v"] is not None else 0
         if current_version < 2:
             conn.executescript(_MIGRATION_V1_TO_V2)
+        if current_version < 3:
+            conn.executescript(_MIGRATION_V2_TO_V3)
 
         # Record schema version (idempotent insert)
         conn.execute(
@@ -633,6 +678,24 @@ class SqliteStore:
                   last_imported_at = excluded.last_imported_at
                 """,
                 state.__dict__,
+            )
+            self.conn.commit()
+
+    # --- Eval results -------------------------------------------------------
+
+    def insert_eval_result(self, result: EvalResult) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO eval_results(
+                    id, run_id, suite, case_id, query, expected,
+                    k, depth, passed, hits_count, top_hit_text, latency_ms, run_at
+                ) VALUES (
+                    :id, :run_id, :suite, :case_id, :query, :expected,
+                    :k, :depth, :passed, :hits_count, :top_hit_text, :latency_ms, :run_at
+                )
+                """,
+                {**result.__dict__, "passed": int(result.passed)},
             )
             self.conn.commit()
 

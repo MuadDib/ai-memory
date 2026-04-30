@@ -1,0 +1,73 @@
+suite: default
+description: "Baseline recall suite — covers profile facts, system constants, and dev context"
+
+cases:
+  - id: embedding-model
+    query: "which text embedding model is configured"
+    expected: "text-embedding-3-small"
+    k: 8
+    depth: fast
+    tags: [system, embeddings]
+
+  - id: embedding-dim
+    query: "embedding vector dimensions"
+    expected: "1536"
+    k: 8
+    depth: fast
+    tags: [system, embeddings]
+
+  - id: vector-db
+    query: "what is used for vector search storage"
+    expected: "sqlite-vec"
+    k: 8
+    depth: fast
+    tags: [system, storage]
+
+  - id: rrf-k
+    query: "reciprocal rank fusion k constant value"
+    expected: "60"
+    k: 8
+    depth: fast
+    tags: [system, recall]
+
+  - id: bm25-engine
+    query: "what powers BM25 keyword search"
+    expected: "FTS5"
+    k: 8
+    depth: fast
+    tags: [system, recall]
+
+  - id: mcp-tool-recall
+    query: "MCP tool name for querying memory"
+    expected: "memory_recall"
+    k: 8
+    depth: fast
+    tags: [mcp, api]
+
+  - id: mcp-tool-remember
+    query: "MCP tool name for saving a memory turn"
+    expected: "memory_remember"
+    k: 8
+    depth: fast
+    tags: [mcp, api]
+
+  - id: llm-provider
+    query: "which LLM model is used for dream cycle consolidation"
+    expected: "gpt-4o-mini"
+    k: 8
+    depth: fast
+    tags: [system, dream]
+
+  - id: primary-language
+    query: "what language is the ai-memory backend written in"
+    expected: "Python"
+    k: 8
+    depth: fast
+    tags: [preference, language]
+
+  - id: consolidation-pipeline
+    query: "how does the memory consolidation dream pipeline work"
+    expected: "consolidat"
+    k: 8
+    depth: deep
+    tags: [system, dream]

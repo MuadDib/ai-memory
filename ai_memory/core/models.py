@@ -152,3 +152,22 @@ class RecallHit:
     text: str
     score: float
     provenance: dict = field(default_factory=dict)
+
+
+@dataclass
+class EvalResult:
+    """One eval-case result, persisted to the eval_results table for regression tracking."""
+
+    id: str              # UUID4 per row
+    run_id: str          # UUID4 shared across all cases in one CLI invocation
+    suite: str           # suite name from YAML
+    case_id: str         # case id from YAML
+    query: str
+    expected: str
+    k: int
+    depth: str
+    passed: bool
+    hits_count: int
+    top_hit_text: str | None   # highest-scored hit text (for debugging failures)
+    latency_ms: int
+    run_at: str          # ISO 8601 UTC
