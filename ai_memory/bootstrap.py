@@ -149,11 +149,29 @@ _BULLET_LINE = re.compile(r"^\s*[-\*]\s+(.+?)\s*$")
 _HEADING = re.compile(r"^#{1,6}\s+")
 
 
+def _is_label_fragment(text: str) -> bool:
+    """Return True for bullet content that is a bare label, not a useful fact.
+
+    Filters two patterns that appear in chatgpt/claude memory exports:
+      - Category headers left as bullets: "Prefers:", "Uses:", "Stack:", ...
+      - Single bare terms with no context: "C#", "Angular", "Terraform", ...
+        (a lone word without spaces or colon adds nothing searchable)
+    """
+    t = text.strip()
+    if t.endswith(":"):
+        return True
+    # Single word (no whitespace), no key:value colon, too short to be a sentence
+    if " " not in t and ":" not in t and len(t) < 20:
+        return True
+    return False
+
+
 def _iter_bullets(text: str):
     """Yield the trimmed text of each bullet line in a markdown document.
 
     We collapse markdown emphasis (`**bold**`, `*ital*`) for cleaner notes
     but otherwise preserve the bullet content as-is.
+    Label-only fragments (e.g. "Prefers:", "Angular") are skipped.
     """
     for line in text.splitlines():
         if _HEADING.match(line):
@@ -162,7 +180,7 @@ def _iter_bullets(text: str):
             content = m.group(1).strip()
             content = re.sub(r"\*+([^*]+)\*+", r"\1", content)  # strip * and **
             content = content.strip()
-            if content:
+            if content and not _is_label_fragment(content):
                 yield content
 
 
