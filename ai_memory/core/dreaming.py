@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 # sqlite-vec returns L2 distance for unit vectors; sim ~ 1 - dist/2. We compare on
 # the *distance* directly so we don't have to assume normalization — smaller is
 # more similar.
-DUPLICATE_DIST_BELOW = 0.10   # essentially identical -> dedup without LLM
+DUPLICATE_DIST_BELOW = 0.20   # essentially identical -> dedup without LLM
 UNRELATED_DIST_ABOVE = 0.55   # clearly unrelated -> insert without LLM
 INTEGRATE_NEIGHBOURS = 5      # how many existing notes to compare a candidate against
 
@@ -213,11 +213,13 @@ def _build_extract_system(entity_vocab: list[str]) -> str:
 INTEGRATE_VERDICT_SYSTEM = (
     "You are a memory consolidation worker. You receive a NEW candidate fact "
     "about a user, and one or more EXISTING facts already stored. For each "
-    "existing fact, classify the relationship: "
-    "DUPLICATE (same fact, no new info), "
-    "CONTRADICTS (directly conflicts), "
-    "COMPLEMENTS (related, adds context, both can stay), "
-    "UNRELATED (different topic). "
+    "existing fact, classify the relationship:\n"
+    "DUPLICATE — same core fact, even if phrased differently or with different detail level; "
+    "prefer this over COMPLEMENTS whenever the underlying claim is the same.\n"
+    "CONTRADICTS — directly conflicts (e.g. old says X, new says not-X).\n"
+    "COMPLEMENTS — genuinely adds new information the existing note lacks and cannot be inferred from it.\n"
+    "UNRELATED — completely different topic.\n"
+    "Bias toward DUPLICATE: if unsure between DUPLICATE and COMPLEMENTS, choose DUPLICATE.\n"
     'Output JSON: [{"existing_id": "...", "verdict": "DUPLICATE|CONTRADICTS|COMPLEMENTS|UNRELATED", "reason": "..."}]. '
     "Output ONLY the JSON array, no prose."
 )

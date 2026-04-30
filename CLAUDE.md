@@ -45,15 +45,15 @@ These are listed in proposal v3 + v4:
 
 ## Open follow-ups (priority order)
 
-1. **Phase 4 dedup tuning** — `DUPLICATE_DIST_BELOW = 0.10` is too strict; visible duplicates in the corpus. Target ~0.35 for `text-embedding-3-small`. Eval harness is live so this is now safe to tune.
-2. **Phase 5 promotion fix** — `PROMOTION_CLUSTER_DIST = 0.30` too tight (median NN distance ~0.82); raise to ~0.55–0.65. Lower `promotion_min_episodes` default from 3 to 2 in config.
-3. **Tag case normalisation** — LLM extracts mixed-case tags (`SYSTEM`, `system`). Lowercase all tags at extraction time in dreaming.py Phase 3.
-4. **Phase 4 contradiction detection** — `invalidated=0` even on direct contradictions. Mid-band similarity LLM-verdict branch isn't earning its call.
-5. **`ai-memory redream --episode <id> [--purge-notes]` admin subcommand** — productise the reset-and-redream recipe. Support `--all-pending` and `--latest` too.
-6. **Auto-upgrade to `gpt-4o` for long episodes** — chunking got us across the line on `gpt-4o-mini` but Phase 4 quality looks model-bound. Per-call escalation rule.
-7. **Pre-render redaction over the rendered transcript** — privacy filter currently runs *before persistence*, but the assembled transcript still has raw creds when sent to OpenAI for dream cycles.
+1. **Phase 4 dedup tuning** — `DUPLICATE_DIST_BELOW` raised 0.10 → 0.20; verdict prompt biased toward DUPLICATE. Will validate on next dream run. `UNRELATED_DIST_ABOVE = 0.55` unchanged.
+2. **Phase 4 contradiction detection** — `invalidated=0` even on direct contradictions. Mid-band similarity LLM-verdict branch isn't earning its call. Needs prompt work + eval cases.
+3. **Pydantic output validation with retry** — LLM JSON output for extract/verdict prompts has no schema enforcement. One bad parse silently drops facts. Add Pydantic models + one retry on validation error.
+4. **`ai-memory redream --episode <id> [--purge-notes]` admin subcommand** — productise the reset-and-redream recipe. Support `--all-pending` and `--latest` too.
+5. **Auto-upgrade to `gpt-4o` for long episodes** — Phase 4 quality looks model-bound. Per-call escalation rule.
+6. **Pre-render redaction** — privacy filter runs before persistence, but assembled transcript still has raw creds when sent to OpenAI for dream cycles.
+7. **Expand eval suite** — add cases for dedup quality and promotion quality; currently only 10 recall cases.
 
-Done: eval harness (`ai-memory eval`, `evals/default.yaml`, 10/10 baseline, persisted to `eval_results` table).
+Done: eval harness; Phase 5 fix (`PROMOTION_CLUSTER_DIST` 0.30→0.65, `promotion_min_episodes` 3→2); tag taxonomy redesign (9 domain tags + entities field, entity vocab injection, fuzzy normalisation); bootstrap importer nesting fix; corpus reset + redream (26 episodes → 501 clean notes with tags+entities).
 
 Still pending from earlier: incremental Phase 3 dreaming, `remember --from-stdin`, cross-encoder rerank, local sentence-transformers embedder, Linux daemon mode.
 

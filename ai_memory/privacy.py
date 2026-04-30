@@ -25,10 +25,10 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         "AWS_SECRET",
         re.compile(r"(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])"),
     ),
-    # OpenAI API key
-    ("OPENAI_API_KEY", re.compile(r"\bsk-[A-Za-z0-9_\-]{20,}\b")),
-    # Anthropic API key
+    # Anthropic API key (must come before OpenAI — sk-ant- also matches sk-)
     ("ANTHROPIC_API_KEY", re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{20,}\b")),
+    # OpenAI API key
+    ("OPENAI_API_KEY", re.compile(r"\bsk-(?!ant-)[A-Za-z0-9_\-]{20,}\b")),
     # GitHub fine-grained PAT
     ("GITHUB_PAT", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b")),
     # Generic bearer header
