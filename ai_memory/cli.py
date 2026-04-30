@@ -492,5 +492,126 @@ def eval(config, suite_path, k, depth, run_id, no_persist):
     sys.exit(0 if passed == total else 1)
 
 
+@main.command("backfill-entities")
+@click.option("--batch-size", default=20, type=int,
+              help="Notes per LLM call. Larger = fewer calls but slower per call.")
+@click.option("--source-filter", default=None,
+              help="Only backfill notes whose tags LIKE this value (e.g. 'bootstrap').")
+@click.option("--dry-run", is_flag=True,
+              help="Print what would be updated without writing to the DB.")
+@click.pass_obj
+def backfill_entities(config, batch_size, source_filter, dry_run):
+    """Backfill entity tags on notes that have none.
+
+    Sends notes in batches to the LLM and writes the extracted entity slugs
+    back to the DB. Useful after importing bootstrap notes, which bypass the
+    dream-cycle entity extraction.
+
+    Examples:\n
+      ai-memory backfill-entities --source-filter bootstrap\n
+      ai-memory backfill-entities --dry-run
+    """
+    import json as _json
+    from ai_memory.core.dreaming import _normalise_entity
+
+    _ENTITY_SYSTEM = (
+        "You extract named entities from short memory facts. "
+        "You will receive a JSON array of objects, each with 'id' and 'text'. "
+        "For EACH, identify 0-5 NAMED things the fact explicitly mentions. "
+        "Valid entities: specific tools, technologies, frameworks, companies, "
+        "projects, geographic places (cities, countries), proper nouns, and "
+        "named activities with a recognised proper name (e.g. 'orienteering', "
+        "'speleology', 'scuba-diving'). "
+        "NOT entities: generic concepts (efficiency, learning, competence), "
+        "abstract qualities (direct, concise, clarity), common nouns (tea, music, "
+        "travel), job titles (technical-lead), or vague terms (automation, environment). "
+        "Normalise each to a lowercase-hyphen-slug (e.g. 'postgresql', 'api-gateway', 'london'). "
+        "Output ONLY a JSON array: "
+        '[{"id": "...", "entities": ["slug1"]}]. '
+        "Empty array [] when no named entity is present. No other text."
+    )
+
+    service = MemoryService.build(config)
+    service.start()
+    try:
+        # Load entity vocab for fuzzy normalisation
+        entity_vocab: list[str] = service.store.list_entity_vocab()
+
+        # Fetch notes with no entities
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(config.database_path)
+        conn.row_factory = _sqlite3.Row
+        q = (
+            "SELECT id, text, tags FROM notes "
+            "WHERE valid_to IS NULL "
+            "  AND (entities IS NULL OR entities = '[]' OR entities = '')"
+        )
+        if source_filter:
+            q += f" AND tags LIKE '%{source_filter}%'"
+        q += " ORDER BY text"
+        rows = conn.execute(q).fetchall()
+        conn.close()
+
+        if not rows:
+            click.echo("No notes need entity backfill.")
+            return
+
+        click.echo(f"Notes to backfill: {len(rows)} (batch_size={batch_size})")
+
+        total_updated = 0
+        total_skipped = 0
+
+        for batch_start in range(0, len(rows), batch_size):
+            batch = rows[batch_start: batch_start + batch_size]
+            payload = [{"id": r["id"], "text": r["text"]} for r in batch]
+
+            try:
+                completion = service.llm.complete(
+                    system=_ENTITY_SYSTEM,
+                    messages=[
+                        __import__("ai_memory.llm.interface", fromlist=["Message"])
+                        .Message(role="user", content=_json.dumps(payload, ensure_ascii=False))
+                    ],
+                    max_tokens=1024,
+                )
+                raw = _json.loads(completion.text.strip())
+            except Exception as exc:
+                click.echo(f"  batch {batch_start}: LLM/parse error — {exc}", err=True)
+                continue
+
+            # Index by id
+            result_map = {item["id"]: item.get("entities", []) for item in raw
+                          if isinstance(item, dict) and "id" in item}
+
+            conn = _sqlite3.connect(config.database_path)
+            for row in batch:
+                raw_entities = result_map.get(row["id"], [])
+                normalised = list({
+                    norm for e in raw_entities
+                    if (norm := _normalise_entity(str(e), entity_vocab))
+                })
+                if not normalised:
+                    total_skipped += 1
+                    continue
+                if dry_run:
+                    click.echo(f"  DRY  {row['id'][:8]}  {row['text'][:60]}  -> {normalised}")
+                else:
+                    conn.execute(
+                        "UPDATE notes SET entities = ? WHERE id = ?",
+                        (_json.dumps(normalised), row["id"]),
+                    )
+                    click.echo(f"  SET  {row['id'][:8]}  {row['text'][:60]}  -> {normalised}")
+                total_updated += 1
+            if not dry_run:
+                conn.commit()
+            conn.close()
+
+        action = "Would update" if dry_run else "Updated"
+        click.echo(f"\n{action} {total_updated} notes  ({total_skipped} had no extractable entities)")
+
+    finally:
+        service.stop()
+
+
 if __name__ == "__main__":
     main()
