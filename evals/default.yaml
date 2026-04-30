@@ -120,3 +120,81 @@ cases:
     k: 8
     depth: fast
     tags: [system, recall]
+
+  # --- Profile / identity (dedup regression) -------------------------------
+  # These also act as dedup regression tests: the canonical (fuller) version
+  # of each fact should be returned, not a stale subset note.
+
+  - id: user-full-name
+    query: "what is Igor's full name including surname"
+    expected: "Valjevic"
+    k: 5
+    depth: fast
+    tags: [profile, personal, dedup-regression]
+
+  - id: user-origin
+    query: "where is Igor originally from, what country was he born in"
+    expected: "Belgrade"
+    k: 5
+    depth: fast
+    tags: [profile, personal, dedup-regression]
+
+  - id: user-role-seniority
+    query: "what is Igor's full job title and seniority level"
+    expected: "Architect"
+    k: 5
+    depth: fast
+    tags: [profile, personal, dedup-regression]
+
+  - id: profile-company
+    query: "what company does Igor currently work for"
+    expected: "Citywire"
+    k: 5
+    depth: fast
+    tags: [profile, promotion-quality]
+
+  # --- Personal breadth ----------------------------------------------------
+
+  - id: drink-preference
+    query: "what does Igor prefer to drink, tea or coffee"
+    expected: "tea"
+    k: 5
+    depth: fast
+    tags: [personal]
+
+  - id: sport-tennis
+    query: "what sport does Igor play most regularly"
+    expected: "tennis"
+    k: 5
+    depth: fast
+    tags: [personal]
+
+  - id: language-learning
+    query: "what language is Igor currently learning"
+    expected: "Italian"
+    k: 5
+    depth: fast
+    tags: [personal]
+
+  # --- Technical breadth ---------------------------------------------------
+
+  - id: backend-language
+    query: "what is Igor's primary backend programming language"
+    expected: ".NET"
+    k: 5
+    depth: fast
+    tags: [preference, technical]
+
+  - id: dev-environment
+    query: "what operating system and shell environment does Igor use for development"
+    expected: "WSL"
+    k: 5
+    depth: fast
+    tags: [technical]
+
+  - id: ui-framework-blazor
+    query: "what UI framework does Igor prefer for building web apps"
+    expected: "Blazor"
+    k: 5
+    depth: fast
+    tags: [preference, technical]
