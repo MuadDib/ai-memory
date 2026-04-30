@@ -261,13 +261,21 @@ INTEGRATE_VERDICT_SYSTEM = (
 )
 
 PROMOTION_SYSTEM = (
-    "You are a memory consolidation worker. You receive a CLUSTER of related "
-    "notes about a user. If the cluster represents a stable, durable fact "
-    "worth promoting to the user's persistent profile, output a single canonical "
-    "key/value pair as JSON. Otherwise output null fields. "
-    'Format: {"key": "snake_case_key", "value": "concise value or null", "rationale": "why"}. '
-    "Examples of good keys: preferred_database, communication_style, primary_language, "
-    "current_company, dev_environment. Output ONLY the JSON object."
+    "You are a memory consolidation worker. You receive a CLUSTER of related notes. "
+    "Decide whether this cluster describes a STABLE, DURABLE attribute of the user "
+    "(Igor) himself — something that characterises who he is, what he prefers, "
+    "how he works, or what he knows. If yes, output a single key/value pair. "
+    "If no, output null fields.\n\n"
+    "PROMOTE: the user's own preferences, skills, role, tools, habits, style, background.\n"
+    "  Good keys: preferred_database, communication_style, primary_language, "
+    "current_company, dev_environment, learning_language, favourite_sport.\n\n"
+    "DO NOT PROMOTE: facts about external companies, technologies, or entities "
+    "that Igor merely *discussed* or *worked with*. The cluster must say something "
+    "enduring about IGOR, not about the external subject.\n"
+    "  BAD examples: 'British Gas revenue', 'AWS pricing model', "
+    "'PostgreSQL release schedule' — these describe the entity, not Igor.\n\n"
+    'Format: {"key": "snake_case_key", "value": "concise value", "rationale": "why"} '
+    "or null fields if declining. Output ONLY the JSON object."
 )
 
 
