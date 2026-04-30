@@ -12,27 +12,11 @@ implicit trigger magic, so behaviour is portable.
 from __future__ import annotations
 
 import json
-import logging
 import sqlite3
 import struct
 import threading
-import time
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-
-logger = logging.getLogger(__name__)
-
-_SLOW_WRITE_S = 1.0  # warn if a single write+commit takes longer than this
-
-
-@contextmanager
-def _timed_write(label: str):
-    t0 = time.monotonic()
-    yield
-    elapsed = time.monotonic() - t0
-    if elapsed >= _SLOW_WRITE_S:
-        logger.warning("slow sqlite write  %s  %.3fs", label, elapsed)
 
 import sqlite_vec
 
@@ -168,9 +152,9 @@ class SqliteStore:
         self._db_path = db_path
         self._embedding_dim = embedding_dim
         self._conn: sqlite3.Connection | None = None
-        # Reentrant lock so the same thread can nest calls (e.g. insert_note
-        # touches three tables in one method). check_same_thread=False lets
-        # worker threads (anyio.to_thread.run_sync callers) use this store.
+        # Reentrant lock: sqlite3.Connection is NOT thread-safe. Multiple
+        # anyio worker threads (concurrent recalls, simultaneous remember+recall)
+        # must serialise all access through this lock.
         self._lock = threading.RLock()
 
     # --- Lifecycle -------------------------------------------------------
@@ -185,7 +169,6 @@ class SqliteStore:
         conn.enable_load_extension(False)
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA busy_timeout = 15000")
         conn.executescript(SCHEMA_SQL)
         conn.execute(
             f"CREATE VIRTUAL TABLE IF NOT EXISTS notes_vec "
@@ -217,7 +200,7 @@ class SqliteStore:
     # --- Profile ---------------------------------------------------------
 
     def upsert_profile(self, profile: Profile) -> None:
-        with self._lock, _timed_write("upsert_profile"):
+        with self._lock:
             self.conn.execute(
                 """
                 INSERT INTO profile(key, value, updated_at, source)
@@ -232,7 +215,7 @@ class SqliteStore:
             self.conn.commit()
 
     def delete_profile(self, key: str) -> None:
-        with self._lock, _timed_write("delete_profile"):
+        with self._lock:
             self.conn.execute("DELETE FROM profile WHERE key = ?", (key,))
             self.conn.commit()
 
@@ -244,7 +227,7 @@ class SqliteStore:
     # --- Notes -----------------------------------------------------------
 
     def insert_note(self, note: Note, embedding: list[float]) -> None:
-        with self._lock, _timed_write("insert_note"):
+        with self._lock:
             cur = self.conn.execute(
                 """
                 INSERT INTO notes(
@@ -269,7 +252,7 @@ class SqliteStore:
             self.conn.commit()
 
     def update_note(self, note: Note) -> None:
-        with self._lock, _timed_write("update_note"):
+        with self._lock:
             self.conn.execute(
                 """
                 UPDATE notes SET
@@ -343,7 +326,7 @@ class SqliteStore:
         return [(_row_to_note(r), float(r["rank"])) for r in rows]
 
     def invalidate_note(self, note_id: str, when: int, superseded_by: str | None) -> None:
-        with self._lock, _timed_write("invalidate_note"):
+        with self._lock:
             self.conn.execute(
                 "UPDATE notes SET valid_to = ?, superseded_by = ? WHERE id = ?",
                 (when, superseded_by, note_id),
@@ -352,7 +335,7 @@ class SqliteStore:
 
     def bump_note_access(self, note_id: str, when: int) -> None:
         """Bump access_count + last_accessed_at when a note is reused (e.g. dedup hit)."""
-        with self._lock, _timed_write("bump_note_access"):
+        with self._lock:
             self.conn.execute(
                 "UPDATE notes SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?",
                 (when, note_id),
@@ -384,7 +367,7 @@ class SqliteStore:
     # --- Episodes --------------------------------------------------------
 
     def insert_episode(self, episode: Episode, embedding: list[float] | None = None) -> None:
-        with self._lock, _timed_write("insert_episode"):
+        with self._lock:
             self.conn.execute(
                 """
                 INSERT INTO episodes(
@@ -410,7 +393,7 @@ class SqliteStore:
         Used by the dream cycle when Phase 3 attaches a real summary/title to a
         bootstrapped episode that was opened with empty fields.
         """
-        with self._lock, _timed_write("update_episode"):
+        with self._lock:
             self.conn.execute(
                 """
                 UPDATE episodes SET
@@ -474,7 +457,7 @@ class SqliteStore:
         return [_row_to_episode(r) for r in rows]
 
     def mark_episode_consolidated(self, episode_id: str, when: int) -> None:
-        with self._lock, _timed_write("mark_episode_consolidated"):
+        with self._lock:
             self.conn.execute(
                 "UPDATE episodes SET consolidated_at = ? WHERE id = ?", (when, episode_id)
             )
@@ -483,7 +466,7 @@ class SqliteStore:
     # --- Turns -----------------------------------------------------------
 
     def insert_turn(self, turn: Turn) -> None:
-        with self._lock, _timed_write("insert_turn"):
+        with self._lock:
             self.conn.execute(
                 """
                 INSERT INTO turns(id, episode_id, raw_file, byte_offset, byte_length, role, ts)
@@ -502,15 +485,13 @@ class SqliteStore:
 
     def count_turns_since(self, ts: int) -> int:
         with self._lock:
-            row = self.conn.execute(
-                "SELECT COUNT(*) AS n FROM turns WHERE ts >= ?", (ts,)
-            ).fetchone()
+            row = self.conn.execute("SELECT COUNT(*) AS n FROM turns WHERE ts >= ?", (ts,)).fetchone()
         return int(row["n"]) if row else 0
 
     # --- Dream log -------------------------------------------------------
 
     def insert_dream_log(self, entry: DreamLog) -> None:
-        with self._lock, _timed_write("insert_dream_log"):
+        with self._lock:
             self.conn.execute(
                 """
                 INSERT INTO dream_log(
@@ -530,7 +511,7 @@ class SqliteStore:
             self.conn.commit()
 
     def update_dream_log(self, entry: DreamLog) -> None:
-        with self._lock, _timed_write("update_dream_log"):
+        with self._lock:
             self.conn.execute(
                 """
                 UPDATE dream_log SET
@@ -580,7 +561,7 @@ class SqliteStore:
         )
 
     def upsert_cowork_import_state(self, state: CoworkImportState) -> None:
-        with self._lock, _timed_write("upsert_cowork_import_state"):
+        with self._lock:
             self.conn.execute(
                 """
                 INSERT INTO cowork_import_state(

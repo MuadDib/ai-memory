@@ -10,7 +10,7 @@ Stack: Python 3.12 with portability discipline so a future C# port is translatio
 
 ## Where things live
 
-The runnable copy is on the user's Windows machine at `C:\ai-mem\` — short path because deeper paths break Python venvs on Windows MAX_PATH. The Cowork outputs folder under `%APPDATA%\Claude\local-agent-mode-sessions\.../outputs\ai-memory\` is treated as source-of-truth; `sync.ps1` (in the outputs root) `robocopy /MIR`s it to `C:\ai-mem\` excluding `.venv` and `__pycache__`. Edit in Cowork outputs, sync to test.
+`C:\ai-mem\ai-memory\` is the source of truth and the working git repo. The path is short because deep paths break Python venvs on Windows MAX_PATH. Edit files directly here — no sync step needed. The old Cowork outputs folder (`%APPDATA%\Claude\local-agent-mode-sessions\.../outputs\ai-memory\`) and `sync.ps1` workflow are retired; ignore them.
 
 Repo layout under `ai-memory/`:
 

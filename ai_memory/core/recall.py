@@ -236,7 +236,7 @@ def recall(
         note_hits.extend(verbatim_hits)
 
     logger.info(
-        "recall done hits=%d total=%.0fms  (embed=%.0fms bm25_wait=%.0fms vec=%.0fms ep=%.0fms)",
+        "recall done hits=%d total=%.0fms  (embed=%.0fms bm25=%.0fms vec=%.0fms ep=%.0fms)",
         len(note_hits),
         (time.monotonic() - t0) * 1000,
         _embed_ms, _bm25_ms, _vec_ms, _ep_ms

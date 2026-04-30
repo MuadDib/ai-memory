@@ -275,7 +275,26 @@ def dream(
 
         # Persist summary + mark consolidated only if we produced something.
         ep.summary = summary_completion.text.strip()
-        ep.title = ep.summary[:80]
+
+        # Generate a proper short title from the summary.  A tiny dedicated
+        # call (≈10 output tokens on gpt-4o-mini) gives far better results
+        # than slicing the first 80 chars of the paragraph.
+        if ep.summary:
+            title_completion = llm.complete(
+                system=(
+                    "You are given a paragraph summarising a conversation. "
+                    "Write a short title for it: 5-8 words, title case, no "
+                    "punctuation at the end. Output only the title — no quotes, "
+                    "no explanation, nothing else."
+                ),
+                messages=[Message(role="user", content=ep.summary)],
+                max_tokens=25,
+            )
+            tokens_used += title_completion.input_tokens + title_completion.output_tokens
+            ep.title = title_completion.text.strip().strip('"').strip("'") or ep.summary[:80]
+        else:
+            ep.title = ""
+
         ep.embedding_model = embedder.model_id
 
         if ep.summary or all_facts:

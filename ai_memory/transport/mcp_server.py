@@ -29,16 +29,20 @@ logger = logging.getLogger(__name__)
 
 
 def _attach_log_file(config: Config) -> None:
-    """Add a FileHandler so MCP server logs land in service-stderr.log.
+    """Add a FileHandler so MCP server logs land in a per-PID log file.
 
     Claude Desktop runs `ai-memory serve` as an stdio subprocess and discards
     its stderr (only stdout carries the MCP protocol).  Without this handler
     every logger.info/warning/error call from the server process is silently
     dropped — making the diagnostic log useless.  We attach the handler once,
     early in serve_mcp(), before any other log calls.
+
+    Each server process gets its own file (service-stderr-<pid>.log) so that
+    concurrent servers writing to the same path don't corrupt each other's
+    output — interleaved writes on Windows produce truncated lines.
     """
     config.logs_dir.mkdir(parents=True, exist_ok=True)
-    log_file = config.logs_dir / "service-stderr.log"
+    log_file = config.logs_dir / f"service-stderr-{os.getpid()}.log"
     fh = logging.FileHandler(log_file, encoding="utf-8")
     fh.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -83,19 +87,23 @@ def build_app(service: MemoryService) -> FastMCP:
     # --- Tools -----------------------------------------------------------
 
     @app.tool()
-    async def memory_remember(text: str, source: str, role: str = "user") -> dict:
+    def memory_remember(text: str, source: str, role: str = "user") -> dict:
         """Store a piece of text as a turn in the active episode for `source`.
 
-        Returns the new turn id, the episode id, and a list of any redactions
-        the privacy filter applied.
+        Returns the new turn id, the episode id, a list of any redactions the
+        privacy filter applied, and server_pid (the OS process id that handled
+        this call — useful for diagnosing which server instance is active).
         """
+        # Synchronous: memory_remember is fast SQLite + file I/O with no
+        # external network calls. The thread offload (anyio.to_thread.run_sync)
+        # caused event-loop starvation under concurrent calls and is not needed
+        # here. Only memory_recall (which calls OpenAI for embeddings) needs it.
         with _timed_tool("memory_remember", source=source, role=role, chars=len(text)):
-            # Run in a worker thread so concurrent remembers don't queue up
-            # and block the event loop while waiting for the SQLite write lock.
-            result = await anyio.to_thread.run_sync(
-                lambda: service.remember(text=text, source=source, role=role)
-            )
-            return asdict(result)
+            result = service.remember(text=text, source=source, role=role)
+            d = asdict(result)
+            d["server_pid"] = os.getpid()
+            logger.info("tool.remember  episode_id=%s server_pid=%d", result.episode_id, os.getpid())
+            return d
 
     @app.tool()
     async def memory_recall(query: str, depth: str = "deep", k: int = 8) -> list[dict]:
@@ -170,7 +178,7 @@ def build_app(service: MemoryService) -> FastMCP:
 def serve_mcp(config: Config) -> None:
     """Boot the service and start the MCP stdio loop. Blocking call."""
     # Claude Desktop discards MCP subprocess stderr (stdout carries the protocol).
-    # Attach a FileHandler so our logs always land in service-stderr.log.
+    # Attach a per-PID FileHandler so our logs always land in service-stderr-<pid>.log.
     _attach_log_file(config)
 
     # No PID lock here — Claude Desktop legitimately spawns one server process
@@ -187,6 +195,15 @@ def serve_mcp(config: Config) -> None:
     )
     try:
         app = build_app(service)
+        # Disable FastMCP's docket worker background task.
+        # FastMCP 2.14.7 runs worker.run_forever() as asyncio.create_task() on
+        # the same event loop as our MCP tools. With memory:// (fakeredis), the
+        # worker polls continuously and intermittently starves the event loop,
+        # causing CallToolRequest messages to sit unread in stdin — triggering the
+        # 4-minute MCP timeout. We register zero background tasks, so the worker
+        # is pure overhead. Setting _is_mounted=True makes _docket_lifespan()
+        # skip both Docket creation and Worker startup entirely.
+        app._is_mounted = True
         app.run()  # FastMCP handles stdio loop
     finally:
         service.stop()
