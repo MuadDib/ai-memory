@@ -119,47 +119,47 @@ SCHEMA_VERSION = 2
 # each statement idempotent — rows already containing 'T' are skipped.
 _MIGRATION_V1_TO_V2 = """
 UPDATE schema_version
-   SET applied_at = datetime(CAST(applied_at AS INTEGER), 'unixepoch') || 'Z'
+   SET applied_at = REPLACE(datetime(CAST(applied_at AS INTEGER), 'unixepoch'), ' ', 'T') || 'Z'
  WHERE applied_at NOT LIKE '%T%';
 
 UPDATE profile
-   SET updated_at = datetime(CAST(updated_at AS INTEGER), 'unixepoch') || 'Z'
+   SET updated_at = REPLACE(datetime(CAST(updated_at AS INTEGER), 'unixepoch'), ' ', 'T') || 'Z'
  WHERE updated_at NOT LIKE '%T%';
 
 UPDATE notes
-   SET valid_from       = datetime(CAST(valid_from AS INTEGER), 'unixepoch') || 'Z',
-       ingested_at      = datetime(CAST(ingested_at AS INTEGER), 'unixepoch') || 'Z',
+   SET valid_from       = REPLACE(datetime(CAST(valid_from AS INTEGER), 'unixepoch'), ' ', 'T') || 'Z',
+       ingested_at      = REPLACE(datetime(CAST(ingested_at AS INTEGER), 'unixepoch'), ' ', 'T') || 'Z',
        valid_to         = CASE WHEN valid_to IS NOT NULL AND valid_to NOT LIKE '%T%'
-                               THEN datetime(CAST(valid_to AS INTEGER), 'unixepoch') || 'Z'
+                               THEN REPLACE(datetime(CAST(valid_to AS INTEGER), 'unixepoch'), ' ', 'T') || 'Z'
                                ELSE valid_to END,
        last_accessed_at = CASE WHEN last_accessed_at IS NOT NULL AND last_accessed_at NOT LIKE '%T%'
-                               THEN datetime(CAST(last_accessed_at AS INTEGER), 'unixepoch') || 'Z'
+                               THEN REPLACE(datetime(CAST(last_accessed_at AS INTEGER), 'unixepoch'), ' ', 'T') || 'Z'
                                ELSE last_accessed_at END
  WHERE valid_from NOT LIKE '%T%';
 
 UPDATE episodes
-   SET started_at     = datetime(CAST(started_at AS INTEGER), 'unixepoch') || 'Z',
-       ended_at       = CASE WHEN ended_at IS NOT NULL AND ended_at NOT LIKE '%T%'
-                             THEN datetime(CAST(ended_at AS INTEGER), 'unixepoch') || 'Z'
-                             ELSE ended_at END,
+   SET started_at      = REPLACE(datetime(CAST(started_at AS INTEGER), 'unixepoch'), ' ', 'T') || 'Z',
+       ended_at        = CASE WHEN ended_at IS NOT NULL AND ended_at NOT LIKE '%T%'
+                              THEN REPLACE(datetime(CAST(ended_at AS INTEGER), 'unixepoch'), ' ', 'T') || 'Z'
+                              ELSE ended_at END,
        consolidated_at = CASE WHEN consolidated_at IS NOT NULL AND consolidated_at NOT LIKE '%T%'
-                              THEN datetime(CAST(consolidated_at AS INTEGER), 'unixepoch') || 'Z'
+                              THEN REPLACE(datetime(CAST(consolidated_at AS INTEGER), 'unixepoch'), ' ', 'T') || 'Z'
                               ELSE consolidated_at END
  WHERE started_at NOT LIKE '%T%';
 
 UPDATE turns
-   SET ts = datetime(CAST(ts AS INTEGER), 'unixepoch') || 'Z'
+   SET ts = REPLACE(datetime(CAST(ts AS INTEGER), 'unixepoch'), ' ', 'T') || 'Z'
  WHERE ts NOT LIKE '%T%';
 
 UPDATE dream_log
-   SET started_at = datetime(CAST(started_at AS INTEGER), 'unixepoch') || 'Z',
+   SET started_at = REPLACE(datetime(CAST(started_at AS INTEGER), 'unixepoch'), ' ', 'T') || 'Z',
        ended_at   = CASE WHEN ended_at IS NOT NULL AND ended_at NOT LIKE '%T%'
-                         THEN datetime(CAST(ended_at AS INTEGER), 'unixepoch') || 'Z'
+                         THEN REPLACE(datetime(CAST(ended_at AS INTEGER), 'unixepoch'), ' ', 'T') || 'Z'
                          ELSE ended_at END
  WHERE started_at NOT LIKE '%T%';
 
 UPDATE cowork_import_state
-   SET last_imported_at = datetime(CAST(last_imported_at AS INTEGER), 'unixepoch') || 'Z'
+   SET last_imported_at = REPLACE(datetime(CAST(last_imported_at AS INTEGER), 'unixepoch'), ' ', 'T') || 'Z'
  WHERE last_imported_at NOT LIKE '%T%';
 """
 
