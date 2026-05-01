@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from ai_memory.core.dreaming import (
+    _CandidateFact,
     _ExtractedFact,
     _IntegrateVerdict,
     _PromotionResult,
@@ -21,9 +22,12 @@ from ai_memory.core.dreaming import (
     _parse_extract_facts,
     _parse_promotion,
     _parse_verdicts,
+    _phase4_integrate,
     _safe_parse_facts,
     _safe_parse_json,
     _sanitise_profile_key,
+    DUPLICATE_DIST_BELOW,
+    UNRELATED_DIST_ABOVE,
 )
 from ai_memory.core.models import Note
 from ai_memory.llm.interface import CompletionResult, Message
@@ -406,3 +410,190 @@ def test_parse_promotion_null_string_decoded_as_none() -> None:
     result = _parse_promotion("null")
     assert result.key is None
     assert result.value is None
+
+
+# --- warnings param on _llm_call_with_retry ------------------------------------
+
+
+def test_llm_call_with_retry_records_failure_in_warnings() -> None:
+    """When both attempts fail, the error is recorded in the warnings list."""
+    llm = _mock_llm("garbage", "still garbage")
+    warnings: list[str] = []
+    result, _ = _llm_call_with_retry(
+        llm=llm,
+        system="sys",
+        user_msg="user",
+        parse_fn=_parse_extract_facts,
+        max_tokens=100,
+        default=[],
+        warnings=warnings,
+    )
+    assert result == []
+    assert len(warnings) == 1
+    assert "failed after retry" in warnings[0]
+
+
+def test_llm_call_with_retry_no_warning_on_success() -> None:
+    """Successful call must not add anything to the warnings list."""
+    llm = _mock_llm('[{"text": "fact", "tags": [], "entities": []}]')
+    warnings: list[str] = []
+    result, _ = _llm_call_with_retry(
+        llm=llm,
+        system="sys",
+        user_msg="user",
+        parse_fn=_parse_extract_facts,
+        max_tokens=100,
+        default=[],
+        warnings=warnings,
+    )
+    assert len(result) == 1
+    assert warnings == []
+
+
+# --- Phase 4 integration paths ------------------------------------------------
+
+
+def _existing_note(id_: str = "existing-1", text: str = "Igor uses PostgreSQL") -> Note:
+    return Note(
+        id=id_,
+        text=text,
+        valid_from=now_iso(),
+        ingested_at=now_iso(),
+        embedding_model="test",
+    )
+
+
+def _make_phase4_store(neighbours: list) -> "MagicMock":
+    """Mock MemoryStore pre-wired with the given search_notes_vector return value."""
+    from unittest.mock import MagicMock
+    store = MagicMock()
+    store.search_notes_vector.return_value = neighbours
+    return store
+
+
+def _make_phase4_embedder(n_candidates: int = 1) -> "MagicMock":
+    from unittest.mock import MagicMock
+    emb = MagicMock()
+    emb.model_id = "test"
+    emb.embed.return_value = [[0.1] * 4 for _ in range(n_candidates)]
+    return emb
+
+
+def test_phase4_clear_duplicate_no_llm() -> None:
+    """Neighbour distance < DUPLICATE_DIST_BELOW → deduped without any LLM call."""
+    existing = _existing_note()
+    store = _make_phase4_store([(existing, DUPLICATE_DIST_BELOW - 0.01)])
+    emb = _make_phase4_embedder()
+    llm = _mock_llm()  # no responses needed — must not be called
+    cand = _CandidateFact(text="Igor uses PostgreSQL", source_episode_id="ep1")
+
+    result, _ = _phase4_integrate(
+        candidates=[cand], store=store, embedder=emb, llm=llm,
+        now=now_iso(), journal=[],
+    )
+
+    assert result["deduped"] == 1
+    assert result["added"] == 0
+    store.bump_note_access.assert_called_once()
+    store.insert_note.assert_not_called()
+    llm.complete.assert_not_called()
+
+
+def test_phase4_clearly_unrelated_inserts_without_llm() -> None:
+    """Nearest neighbour distance > UNRELATED_DIST_ABOVE → inserted without LLM."""
+    existing = _existing_note()
+    store = _make_phase4_store([(existing, UNRELATED_DIST_ABOVE + 0.01)])
+    emb = _make_phase4_embedder()
+    llm = _mock_llm()
+    cand = _CandidateFact(text="A completely unrelated fact", source_episode_id="ep1")
+
+    result, _ = _phase4_integrate(
+        candidates=[cand], store=store, embedder=emb, llm=llm,
+        now=now_iso(), journal=[],
+    )
+
+    assert result["added"] == 1
+    store.insert_note.assert_called_once()
+    llm.complete.assert_not_called()
+
+
+def test_phase4_midband_contradicts_invalidates_existing() -> None:
+    """Mid-band + CONTRADICTS verdict → new note inserted, existing invalidated."""
+    existing = _existing_note(text="Igor uses PostgreSQL as primary database")
+    mid_dist = (DUPLICATE_DIST_BELOW + UNRELATED_DIST_ABOVE) / 2
+    store = _make_phase4_store([(existing, mid_dist)])
+    emb = _make_phase4_embedder()
+    llm = _mock_llm(
+        f'[{{"existing_id": "{existing.id}", "verdict": "CONTRADICTS", "reason": "db changed"}}]'
+    )
+    cand = _CandidateFact(
+        text="Igor switched to MySQL as his primary database", source_episode_id="ep1"
+    )
+
+    result, _ = _phase4_integrate(
+        candidates=[cand], store=store, embedder=emb, llm=llm,
+        now=now_iso(), journal=[],
+    )
+
+    assert result["added"] == 1
+    assert result["invalidated"] == 1
+    assert result["deduped"] == 0
+    store.insert_note.assert_called_once()
+    store.invalidate_note.assert_called_once()
+    # Existing note is what gets invalidated.
+    invalidated_id = store.invalidate_note.call_args[0][0]
+    assert invalidated_id == existing.id
+
+
+def test_phase4_midband_duplicate_via_llm_no_insert() -> None:
+    """Mid-band + DUPLICATE verdict → deduped, no insert."""
+    existing = _existing_note()
+    mid_dist = (DUPLICATE_DIST_BELOW + UNRELATED_DIST_ABOVE) / 2
+    store = _make_phase4_store([(existing, mid_dist)])
+    emb = _make_phase4_embedder()
+    llm = _mock_llm(
+        f'[{{"existing_id": "{existing.id}", "verdict": "DUPLICATE", "reason": "same fact"}}]'
+    )
+    cand = _CandidateFact(
+        text="Igor prefers PostgreSQL for relational data", source_episode_id="ep1"
+    )
+
+    result, _ = _phase4_integrate(
+        candidates=[cand], store=store, embedder=emb, llm=llm,
+        now=now_iso(), journal=[],
+    )
+
+    assert result["deduped"] == 1
+    assert result["added"] == 0
+    store.insert_note.assert_not_called()
+    llm.complete.assert_called_once()
+
+
+def test_phase4_value_change_now_reaches_llm() -> None:
+    """Facts differing only in a value (0.10 < dist < 0.20) must reach the LLM.
+
+    This is the key regression test for the DUPLICATE_DIST_BELOW=0.10 change.
+    With the old threshold of 0.20, a distance of 0.15 would be silently
+    deduped. With the new 0.10 threshold it enters the mid-band and the LLM
+    can classify it as CONTRADICTS (e.g. port 8080 → port 9000).
+    """
+    existing = _existing_note(text="The service runs on port 8080")
+    value_change_dist = 0.15  # in old dead-zone (0.10–0.20), now in mid-band
+    store = _make_phase4_store([(existing, value_change_dist)])
+    emb = _make_phase4_embedder()
+    llm = _mock_llm(
+        f'[{{"existing_id": "{existing.id}", "verdict": "CONTRADICTS", "reason": "port changed"}}]'
+    )
+    cand = _CandidateFact(
+        text="The service runs on port 9000", source_episode_id="ep1"
+    )
+
+    result, _ = _phase4_integrate(
+        candidates=[cand], store=store, embedder=emb, llm=llm,
+        now=now_iso(), journal=[],
+    )
+
+    # LLM must have been consulted (key assertion for the threshold change).
+    llm.complete.assert_called_once()
+    assert result["invalidated"] == 1
+    assert result["added"] == 1

@@ -54,7 +54,11 @@ logger = logging.getLogger(__name__)
 # sqlite-vec returns L2 distance for unit vectors; sim ~ 1 - dist/2. We compare on
 # the *distance* directly so we don't have to assume normalization — smaller is
 # more similar.
-DUPLICATE_DIST_BELOW = 0.20   # essentially identical -> dedup without LLM
+DUPLICATE_DIST_BELOW = 0.10   # essentially identical -> dedup without LLM
+# Lowered from 0.20: facts that differ only in a value (port number, version,
+# tool name) sit in the 0.10–0.20 band and must reach the LLM so that
+# "port 8080 → port 9000" and "PostgreSQL → MySQL" are caught as CONTRADICTS
+# rather than silently short-circuited as duplicates.
 UNRELATED_DIST_ABOVE = 0.55   # clearly unrelated -> insert without LLM
 INTEGRATE_NEIGHBOURS = 5      # how many existing notes to compare a candidate against
 
@@ -241,21 +245,31 @@ def _build_extract_system(entity_vocab: list[str]) -> str:
 
 INTEGRATE_VERDICT_SYSTEM = (
     "You are a memory consolidation worker. You receive a NEW candidate fact "
-    "about a user, and one or more EXISTING facts already stored. For each "
-    "existing fact, classify the relationship:\n\n"
-    "DUPLICATE — same core claim, even if phrased differently, at different detail levels, "
-    "or using equivalent terms (e.g. 'eu-west-1' vs 'Europe Ireland', 'Postgres' vs 'PostgreSQL'). "
-    "Prefer DUPLICATE over COMPLEMENTS whenever the underlying assertion is the same.\n\n"
-    "CONTRADICTS — the new fact directly reverses or invalidates the existing one. "
-    "Only use this when the two facts cannot both be true at the same time. "
-    "Examples: old='Igor uses PostgreSQL', new='Igor switched to MySQL'; "
-    "old='service runs on port 8080', new='service runs on port 9000'. "
-    "Different-but-compatible details (e.g. two different AWS regions for two different services) "
-    "are NOT contradictions.\n\n"
-    "COMPLEMENTS — adds genuinely new information that cannot be inferred from the existing note.\n\n"
+    "and one or more EXISTING facts already stored. For each existing fact, "
+    "classify the relationship using exactly one of these four verdicts:\n\n"
+    "DUPLICATE — the new fact asserts the SAME claim as the existing fact: "
+    "same subject, same attribute, same value — just rephrased or at a different "
+    "detail level. Equivalent terms count as same value "
+    "('Postgres' = 'PostgreSQL', 'eu-west-1' = 'Europe Ireland').\n\n"
+    "CONTRADICTS — the new fact asserts a DIFFERENT value for the SAME attribute "
+    "of the SAME subject. The key pattern is: [same subject] + [same attribute] "
+    "+ [different value] → CONTRADICTS. The existing fact must be updated because "
+    "it is no longer true. Examples:\n"
+    "  old='Igor uses PostgreSQL as primary DB', new='Igor switched to MySQL' "
+    "→ CONTRADICTS (same person, same attribute: primary DB, different value)\n"
+    "  old='service runs on port 8080', new='service runs on port 9000' "
+    "→ CONTRADICTS (same service, same attribute: port, different value)\n"
+    "  old='Igor works at Citywire', new='Igor left Citywire and joined Acme' "
+    "→ CONTRADICTS (same person, same attribute: employer, different value)\n"
+    "  old='system uses Python 3.11', new='system upgraded to Python 3.12' "
+    "→ CONTRADICTS (same system, same attribute: Python version, different value)\n"
+    "Do NOT label as DUPLICATE when the value has changed — that is CONTRADICTS.\n"
+    "Different subjects or compatible parallel facts are NOT contradictions "
+    "(two services on different ports, two projects in different regions).\n\n"
+    "COMPLEMENTS — adds genuinely new information not inferable from the existing note.\n\n"
     "UNRELATED — completely different topic.\n\n"
-    "Bias toward DUPLICATE over COMPLEMENTS when the core claim is the same. "
-    "Only use CONTRADICTS when the facts are mutually exclusive.\n"
+    "Bias DUPLICATE over COMPLEMENTS when the underlying value is the same. "
+    "Use CONTRADICTS whenever the value of an existing attribute has clearly changed.\n"
     'Output JSON: [{"existing_id": "...", "verdict": "DUPLICATE|CONTRADICTS|COMPLEMENTS|UNRELATED", "reason": "..."}]. '
     "Output ONLY the JSON array, no prose."
 )
