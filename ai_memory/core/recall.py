@@ -208,6 +208,11 @@ def recall(
     ]
     note_hits.extend(episode_hits)
 
+    # Re-sort after extending so note and episode hits are interleaved by score
+    # rather than notes-first, episodes-last. Without this, a highly-relevant
+    # episode summary always ranks below every note hit regardless of score.
+    note_hits.sort(key=lambda h: h.score, reverse=True)
+
     # Final relevance gate: drop anything below the absolute score floor.
     if config.final_score_floor > 0:
         note_hits = [h for h in note_hits if h.score >= config.final_score_floor]

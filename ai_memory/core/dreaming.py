@@ -374,6 +374,7 @@ def dream(
         turn_chunks = _chunk_turns(turns)
         all_facts: List[_ExtractedFact] = []
         chunk_sizes: List[int] = []
+        chunk_warnings: List[str] = []  # structured failure log (Horcrux: typed failure result)
         for chunk_turns in turn_chunks:
             chunk_transcript = _render_transcript(raw, chunk_turns)
             extract_user_msg = (
@@ -390,6 +391,7 @@ def dream(
                 parse_fn=_parse_extract_facts,
                 max_tokens=4000,
                 default=[],
+                warnings=chunk_warnings,
             )
             tokens_used += chunk_tokens
             all_facts.extend(chunk_facts)
@@ -455,7 +457,13 @@ def dream(
             f"{', refusal=' + summary_completion.refusal[:120] if summary_completion.refusal else ''}) "
             f"candidates={ep_candidates} (per-chunk={chunk_sizes})"
         )
-        if ep_candidates == 0:
+        if chunk_warnings:
+            # Structured failure log: surface extraction failures directly in the
+            # dream journal so they're visible in `ai-memory dream-log` without
+            # having to grep the Python logger output.
+            for w in chunk_warnings:
+                journal.append(f"    EXTRACT_FAILURE: {w}")
+        if ep_candidates == 0 and not chunk_warnings:
             journal.append(
                 "    note: 0 candidate facts extracted — "
                 "short episode, parse failure (see logs), or all facts deduplicated"
@@ -873,6 +881,7 @@ def _llm_call_with_retry(
     parse_fn: "Callable[[str], _T]",
     max_tokens: int,
     default: "_T",
+    warnings: "list[str] | None" = None,
 ) -> "Tuple[_T, int]":
     """Make an LLM call, validate with parse_fn, retry once on schema failure.
 
@@ -917,7 +926,10 @@ def _llm_call_with_retry(
     try:
         return parse_fn(retry_completion.text), tokens
     except (ValueError, ValidationError) as err2:
-        logger.error("LLM output validation failed after retry — using default: %s", err2)
+        msg = f"LLM output validation failed after retry — using default: {err2}"
+        logger.error(msg)
+        if warnings is not None:
+            warnings.append(msg)
         return default, tokens
 
 
