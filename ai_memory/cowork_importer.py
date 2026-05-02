@@ -124,9 +124,15 @@ def import_cowork_sessions(
 
 
 def _iter_session_files(root: Path) -> Iterable[Path]:
-    """Yield every ``*.jsonl`` under ``root/**/.claude/projects/**`` or
-    ``root/**/projects/**``. Order isn't guaranteed; resume state makes it
-    re-runnable safely.
+    """Yield every ``*.jsonl`` under ``root/**/.claude/projects/**``,
+    ``root/**/projects/**``, or directly under ``root/*/*.jsonl``.
+
+    The third pattern handles the common case where ``root`` is passed as
+    ``~/.claude/projects`` directly (the default for Claude Code sessions),
+    so the structure is ``<root>/<project-name>/<session-id>.jsonl``.
+
+    Order isn't guaranteed; resume state makes it re-runnable safely.
+    The ``seen`` set deduplicates across all three patterns.
     """
     seen: set[Path] = set()
     for jsonl_path in root.rglob(".claude/projects/*/*.jsonl"):
@@ -135,6 +141,13 @@ def _iter_session_files(root: Path) -> Iterable[Path]:
         seen.add(jsonl_path)
         yield jsonl_path
     for jsonl_path in root.rglob("projects/*/*.jsonl"):
+        if jsonl_path in seen:
+            continue
+        seen.add(jsonl_path)
+        yield jsonl_path
+    # Direct layout: root IS the projects dir (e.g. ~/.claude/projects).
+    # Files sit at root/<project-name>/<session-id>.jsonl.
+    for jsonl_path in root.glob("*/*.jsonl"):
         if jsonl_path in seen:
             continue
         seen.add(jsonl_path)
