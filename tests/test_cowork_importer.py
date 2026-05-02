@@ -6,11 +6,75 @@ integration test once we have a fixture session file.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
 from ai_memory.cowork_importer import (
     _flatten_blocks,
+    _iter_session_files,
     _normalise_content,
     _parse_timestamp,
 )
+
+
+# --- _iter_session_files layout coverage -----------------------------------
+
+
+def _touch(path: Path) -> Path:
+    """Create a file and all parent directories."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}")
+    return path
+
+
+def test_iter_direct_layout(tmp_path: Path) -> None:
+    """root IS the projects dir: root/<project>/<session>.jsonl (new Claude Code)."""
+    f1 = _touch(tmp_path / "C--my-project" / "aabbccdd-0000-0000-0000-000000000001.jsonl")
+    f2 = _touch(tmp_path / "C--my-project" / "aabbccdd-0000-0000-0000-000000000002.jsonl")
+    found = set(_iter_session_files(tmp_path))
+    assert found == {f1, f2}
+
+
+def test_iter_nested_dotclaude_layout(tmp_path: Path) -> None:
+    """Old Cowork UWP layout: root/.claude/projects/<project>/<session>.jsonl."""
+    f = _touch(tmp_path / ".claude" / "projects" / "my-project" / "session-abc.jsonl")
+    found = set(_iter_session_files(tmp_path))
+    assert f in found
+
+
+def test_iter_nested_projects_layout(tmp_path: Path) -> None:
+    """Alternate layout: root/projects/<project>/<session>.jsonl."""
+    f = _touch(tmp_path / "projects" / "my-project" / "session-abc.jsonl")
+    found = set(_iter_session_files(tmp_path))
+    assert f in found
+
+
+def test_iter_no_duplicates_when_patterns_overlap(tmp_path: Path) -> None:
+    """The seen-set must prevent a file from being yielded twice even if
+    multiple glob patterns could match it."""
+    # A file at root/projects/proj/s.jsonl is matched by both
+    # rglob("projects/*/*.jsonl") and glob("*/*.jsonl") — only one yield expected.
+    f = _touch(tmp_path / "projects" / "proj" / "s.jsonl")
+    results = list(_iter_session_files(tmp_path))
+    assert results.count(f) == 1
+
+
+def test_iter_ignores_files_at_wrong_depth(tmp_path: Path) -> None:
+    """A .jsonl file sitting directly under root (depth 1) is not a session file."""
+    _touch(tmp_path / "stray.jsonl")
+    found = set(_iter_session_files(tmp_path))
+    assert found == set()
+
+
+def test_iter_ignores_deeply_nested_non_session_files(tmp_path: Path) -> None:
+    """A .jsonl buried 4+ levels deep that doesn't match any project layout
+    should not appear — or if it does, the seen-set still prevents duplicates."""
+    # This file is at a depth that glob("*/*.jsonl") won't reach and the
+    # rglob patterns require a specific directory name, so it won't match.
+    _touch(tmp_path / "a" / "b" / "c" / "d" / "deep.jsonl")
+    found = set(_iter_session_files(tmp_path))
+    assert found == set()
 
 
 # --- Content normalisation -------------------------------------------------
