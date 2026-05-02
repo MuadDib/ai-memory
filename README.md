@@ -23,59 +23,90 @@ This project explicitly models four tiers and a sleep-style consolidation cycle:
 
 See [`docs/decisions/`](docs/decisions/) for the full set of architectural decision records.
 
-## Quickstart (Windows)
+## Quickstart — Windows (PowerShell)
+
+> **Note:** Clone to a short path. Deep paths break Python venvs on Windows due to MAX_PATH limits.
 
 ```powershell
-# 1. Install
-git clone <this repo>
-cd ai-memory
-python -m venv .venv
+# 1. Clone and install
+git clone https://github.com/MuadDib/ai-memory.git C:\ai-mem\ai-memory
+cd C:\ai-mem\ai-memory
+
+# Allow venv activation scripts (only needed once per machine)
+Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+
+py -3.11 -m venv .venv          # requires Python 3.11+; use py -3.12 if you have 3.12
 .\.venv\Scripts\Activate.ps1
 pip install -e .
 
-# 2. Configure — OpenAI is used for both embeddings and dream-cycle LLM
+# 2. Set your OpenAI API key
+# Current session only:
 $env:OPENAI_API_KEY = "sk-..."
+# — or persist it for all future sessions:
+[System.Environment]::SetEnvironmentVariable("OPENAI_API_KEY", "sk-...", "User")
 
-# 3. Bootstrap from your existing AI memory exports (optional but recommended)
+# 3. Verify the install
+ai-memory stats     # should print zeroes, not an error
+
+# 4. Bootstrap from existing AI memory exports (optional but recommended)
 ai-memory bootstrap --chatgpt path\to\chatgpt-memory.md --claude path\to\claude-memory.md
 
-# 4. Run the MCP server
+# 5. Wire into your MCP client (see below), then start the server
 ai-memory serve
 ```
 
-## Wiring into Claude Desktop
+## Quickstart — Linux / macOS (bash)
 
-Edit `%APPDATA%\Claude\claude_desktop_config.json`:
+```bash
+# 1. Clone and install
+git clone https://github.com/MuadDib/ai-memory.git ~/ai-memory
+cd ~/ai-memory
+python3.11 -m venv .venv        # requires Python 3.11+
+source .venv/bin/activate
+pip install -e .
+
+# 2. Set your OpenAI API key
+export OPENAI_API_KEY="sk-..."
+# Add to ~/.bashrc or ~/.zshrc to persist across sessions
+
+# 3. Verify the install
+ai-memory stats
+
+# 4. Bootstrap (optional)
+ai-memory bootstrap --chatgpt path/to/chatgpt-memory.md --claude path/to/claude-memory.md
+
+# 5. Wire into your MCP client (see below), then start the server
+ai-memory serve
+```
+
+## Wiring into MCP clients
+
+The MCP server runs on stdio — your client spawns it as a subprocess. The config block is the same for all clients; only the config file location differs.
 
 ```json
 {
   "mcpServers": {
     "ai-memory": {
       "command": "ai-memory",
-      "args": ["serve"]
+      "args": ["serve"],
+      "env": { "OPENAI_API_KEY": "sk-..." }
     }
   }
 }
 ```
 
-Restart Claude Desktop. You'll see `ai-memory` appear as a tools provider with `memory_recall`, `memory_remember`, `memory_dream`, etc.
+> If `ai-memory` isn't on your system PATH (e.g. you're using a venv), use the full path to the script:
+> - Windows: `"command": "C:\\ai-mem\\ai-memory\\.venv\\Scripts\\ai-memory.exe"`
+> - Linux/macOS: `"command": "/home/you/ai-memory/.venv/bin/ai-memory"`
 
-## Wiring into Cursor
+| Client | Config file |
+|---|---|
+| **Claude Desktop** | `%APPDATA%\Claude\claude_desktop_config.json` (Windows) / `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) |
+| **Claude Code** | `.claude/mcp.json` in your project, or `~/.claude/mcp.json` globally |
+| **Cursor** | `~/.cursor/mcp.json` or Settings → MCP |
+| **Cline / Continue / Zed** | Their respective MCP config files |
 
-Add to `~/.cursor/mcp.json` (or via Settings → MCP):
-
-```json
-{
-  "mcpServers": {
-    "ai-memory": {
-      "command": "ai-memory",
-      "args": ["serve"]
-    }
-  }
-}
-```
-
-Same database. Same memories. Same `profile.md`.
+Restart the client after editing. All clients share the same `memory.db` — same memories, same `profile.md`, regardless of which tool wrote them.
 
 ## File layout (what lives where)
 
