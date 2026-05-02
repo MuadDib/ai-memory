@@ -26,7 +26,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from uuid import uuid4
+from ai_memory.ids import new_id
 
 from ai_memory.core.models import Episode, Note, Profile, Turn
 from ai_memory.core.service import MemoryService
@@ -101,7 +101,7 @@ def bootstrap_from_markdown(
     exports_copy.write_text(text, encoding="utf-8")
 
     # Create episode + single big turn for verbatim
-    episode_id = str(uuid4())
+    episode_id = new_id()
     episode = Episode(
         id=episode_id,
         title=title or f"Bootstrap: {file_path.name}",
@@ -116,7 +116,7 @@ def bootstrap_from_markdown(
     service.store.insert_episode(episode, embedding=None)
     service.store.insert_turn(
         Turn(
-            id=str(uuid4()),
+            id=new_id(),
             episode_id=episode_id,
             raw_file=episode.raw_file,
             byte_offset=0,
@@ -174,7 +174,7 @@ def bootstrap_from_markdown(
                     continue
 
         note = Note(
-            id=str(uuid4()),
+            id=new_id(),
             text=bullet,
             tags=[source, "bootstrap"] + (["profile-promoted"] if promoted else []),
             source_episode_ids=[episode_id],

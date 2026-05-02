@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import TYPE_CHECKING, Callable, Iterable, List, Literal, Tuple, TypeVar
 
-from uuid import uuid4
+from ai_memory.ids import new_id
 
 from pydantic import BaseModel, ValidationError
 
@@ -314,7 +314,7 @@ def dream(
     matters most.  Phase 4 and Phase 5 always use the base `llm`.
     """
     now = now if now is not None else now_iso()
-    log_id = str(uuid4())
+    log_id = new_id()
 
     log = DreamLog(id=log_id, started_at=now, trigger=request.trigger)
     store.insert_dream_log(log)
@@ -643,7 +643,7 @@ def _insert_candidate(
 ) -> str:
     """Persist a candidate as a new note. Returns the new note id."""
     note = Note(
-        id=str(uuid4()),
+        id=new_id(),
         text=cand.text,
         tags=cand.tags,
         entities=cand.entities,

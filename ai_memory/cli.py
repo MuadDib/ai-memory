@@ -396,8 +396,8 @@ def eval(config, suite_path, k, depth, run_id, no_persist):
     Exits 0 if all cases pass, 1 if any case fails — suitable for CI gates.
     """
     import sqlite3 as _sqlite3
-    from uuid import uuid4
     from ai_memory.eval import load_suite, run_suite
+    from ai_memory.ids import new_id
     from ai_memory.core.models import EvalResult
     from ai_memory.timestamps import now_iso
 
@@ -417,7 +417,7 @@ def eval(config, suite_path, k, depth, run_id, no_persist):
             )
 
     suite = load_suite(suite_path)
-    run_id = run_id or str(uuid4())
+    run_id = run_id or new_id()
 
     service = MemoryService.build(config)
     service.start()
@@ -436,7 +436,7 @@ def eval(config, suite_path, k, depth, run_id, no_persist):
             )
 
             er = EvalResult(
-                id=str(uuid4()),
+                id=new_id(),
                 run_id=run_id,
                 suite=suite.suite,
                 case_id=cr.case.id,
