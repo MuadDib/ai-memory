@@ -18,9 +18,10 @@ $logFile   = "$env:LOCALAPPDATA\ai-memory\logs\hook-precompact.log"
 $dreamLog  = "$env:LOCALAPPDATA\ai-memory\logs\dream-async.log"
 
 try {
+    $claudeRoot = "$env:USERPROFILE\.claude\projects"
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    "[$ts] pre-compact: import-cowork" | Add-Content -Path $logFile -Encoding UTF8
-    & $aiMemory import-cowork 2>&1 | Add-Content -Path $logFile -Encoding UTF8
+    "[$ts] pre-compact: import-cowork --root $claudeRoot" | Add-Content -Path $logFile -Encoding UTF8
+    & $aiMemory import-cowork --root $claudeRoot 2>&1 | Add-Content -Path $logFile -Encoding UTF8
 
     # Spawn dream as a fully detached process — no parent/child relationship,
     # returns before dream finishes, does not block compaction.

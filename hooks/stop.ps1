@@ -12,9 +12,10 @@ $aiMemory = "C:\ai-mem\ai-memory\.venv\Scripts\ai-memory.exe"
 $logFile  = "$env:LOCALAPPDATA\ai-memory\logs\hook-stop.log"
 
 try {
+    $claudeRoot = "$env:USERPROFILE\.claude\projects"
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    "[$ts] stop: import-cowork" | Add-Content -Path $logFile -Encoding UTF8
-    & $aiMemory import-cowork 2>&1 | Add-Content -Path $logFile -Encoding UTF8
+    "[$ts] stop: import-cowork --root $claudeRoot" | Add-Content -Path $logFile -Encoding UTF8
+    & $aiMemory import-cowork --root $claudeRoot 2>&1 | Add-Content -Path $logFile -Encoding UTF8
 } catch {
     # Never surface errors to Claude Code — memory capture is best-effort
 }
