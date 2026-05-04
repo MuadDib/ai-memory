@@ -593,10 +593,10 @@ def _phase4_integrate(
                 break  # done with this candidate
             if v.verdict == "CONTRADICTS":
                 # Insert the new fact, then invalidate the old one and link them.
-                new_id = _insert_candidate(
+                inserted_id = _insert_candidate(
                     store, cand, cand_emb, embedder, now, contradicts=[v.existing_id]
                 )
-                store.invalidate_note(v.existing_id, when=now, superseded_by=new_id)
+                store.invalidate_note(v.existing_id, when=now, superseded_by=inserted_id)
                 invalidated += 1
                 added += 1
                 action_taken = True

@@ -105,9 +105,9 @@ def _find_or_open_episode(store: "MemoryStore", source: str, now: str) -> str:
             continue
         return ep.id
 
-    new_id = new_id()
+    episode_id = new_id()
     episode = Episode(
-        id=new_id,
+        id=episode_id,
         title="",  # populated by dream cycle
         summary="",  # populated by dream cycle
         source=source,
@@ -117,4 +117,4 @@ def _find_or_open_episode(store: "MemoryStore", source: str, now: str) -> str:
         embedding_model="",
     )
     store.insert_episode(episode, embedding=None)
-    return new_id
+    return episode_id
