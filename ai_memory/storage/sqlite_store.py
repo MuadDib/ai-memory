@@ -637,7 +637,7 @@ class SqliteStore:
         with self._lock:
             self.conn.execute(
                 """
-                INSERT INTO turns(id, episode_id, raw_file, byte_offset, byte_length, role, ts)
+                INSERT OR IGNORE INTO turns(id, episode_id, raw_file, byte_offset, byte_length, role, ts)
                 VALUES (:id, :episode_id, :raw_file, :byte_offset, :byte_length, :role, :ts)
                 """,
                 turn.__dict__,

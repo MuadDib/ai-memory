@@ -343,17 +343,26 @@ def import_cowork(config, root_path, include_tools, session_id):
     """
     import os
     if root_path is None:
-        default = os.environ.get("LOCALAPPDATA", "")
-        if not default:
+        # Current Claude Code (all platforms) stores sessions under ~/.claude/projects/
+        userprofile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+        new_root = Path(userprofile) / ".claude" / "projects"
+        # Legacy Cowork (Windows Store/UWP app) used a different location
+        localappdata = os.environ.get("LOCALAPPDATA", "")
+        old_root = (
+            Path(localappdata) / "Packages" / "Claude_pzs8sxrjxfjjc"
+            / "LocalCache" / "Roaming" / "Claude" / "local-agent-mode-sessions"
+            if localappdata else Path("__nonexistent__")
+        )
+        if new_root.exists():
+            root_path = new_root
+        elif old_root.exists():
+            root_path = old_root
+        else:
             raise click.UsageError(
-                "Could not infer default --root (LOCALAPPDATA not set). "
-                "Pass --root explicitly."
-            )
-        root_path = Path(default) / "Packages" / "Claude_pzs8sxrjxfjjc" / \
-            "LocalCache" / "Roaming" / "Claude" / "local-agent-mode-sessions"
-        if not root_path.exists():
-            raise click.UsageError(
-                f"Default root not found at {root_path}. Pass --root <dir> to override."
+                f"Could not find a Claude Code sessions directory.\n"
+                f"Tried: {new_root}\n"
+                f"      {old_root}\n"
+                "Pass --root <dir> to override."
             )
 
     from ai_memory.cowork_importer import import_cowork_sessions
@@ -372,6 +381,42 @@ def import_cowork(config, root_path, include_tools, session_id):
             f"new={result.sessions_imported_new} "
             f"extended={result.sessions_extended} "
             f"unchanged={result.sessions_skipped_unchanged} "
+            f"turns_inserted={result.turns_inserted}"
+        )
+    finally:
+        service.stop()
+
+
+@main.command("import-chatgpt")
+@click.argument("zip_path", type=click.Path(exists=True, path_type=Path))
+@click.option("--include-tools", is_flag=True,
+              help="Include tool/code content blocks in the imported text.")
+@click.pass_obj
+def import_chatgpt(config, zip_path, include_tools):
+    """Import a ChatGPT conversation export zip into ai-memory.
+
+    ZIP_PATH is the .zip file downloaded from ChatGPT → Settings →
+    Data controls → Export data. Contains conversations-NNN.json files.
+
+    Each conversation becomes one Episode + Turn rows. Re-runnable:
+    unchanged conversations are skipped; extended ones are re-imported.
+    Run `ai-memory dream` afterwards to consolidate into notes.
+    """
+    from ai_memory.chatgpt_importer import import_chatgpt_zip
+
+    service = MemoryService.build(config)
+    service.start()
+    try:
+        result = import_chatgpt_zip(
+            service=service,
+            zip_path=zip_path,
+            include_tools=include_tools,
+        )
+        click.echo(
+            f"conversations seen={result.conversations_seen} "
+            f"new={result.conversations_imported_new} "
+            f"extended={result.conversations_extended} "
+            f"unchanged={result.conversations_skipped_unchanged} "
             f"turns_inserted={result.turns_inserted}"
         )
     finally:
