@@ -15,6 +15,7 @@ tests pass alternative components directly to `__init__` for substitution.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 from dataclasses import dataclass
 
@@ -29,6 +30,7 @@ from ai_memory.embeddings.interface import Embedder
 from ai_memory.embeddings.openai_embedder import OpenAIEmbedder
 from ai_memory.llm.anthropic_llm import AnthropicLlm
 from ai_memory.llm.interface import Llm
+from ai_memory.process_lock import PidLock
 from ai_memory.storage.interface import MemoryStore
 from ai_memory.storage.raw_files import RawTranscriptStore
 from ai_memory.storage.sqlite_store import SqliteStore
@@ -65,12 +67,18 @@ class MemoryService:
                 f"Embedding provider '{config.embeddings.provider}' not yet supported in v0.1"
             )
 
+        # Rate-limit retry/backoff knobs shared by both providers.
+        retry_kwargs = {
+            "max_retries": config.dream.rate_limit_max_retries,
+            "backoff_seconds": config.dream.rate_limit_backoff_seconds,
+        }
+
         llm: Llm
         if config.llm.provider == "anthropic":
-            llm = AnthropicLlm(model=config.llm.model)
+            llm = AnthropicLlm(model=config.llm.model, **retry_kwargs)
         elif config.llm.provider == "openai":
             from ai_memory.llm.openai_llm import OpenAILlm
-            llm = OpenAILlm(model=config.llm.model)
+            llm = OpenAILlm(model=config.llm.model, **retry_kwargs)
         else:
             raise NotImplementedError(
                 f"LLM provider '{config.llm.provider}' not yet supported in v0.1"
@@ -80,10 +88,10 @@ class MemoryService:
         quality_llm: Llm | None = None
         if config.llm.quality_model:
             if config.llm.provider == "anthropic":
-                quality_llm = AnthropicLlm(model=config.llm.quality_model)
+                quality_llm = AnthropicLlm(model=config.llm.quality_model, **retry_kwargs)
             elif config.llm.provider == "openai":
                 from ai_memory.llm.openai_llm import OpenAILlm
-                quality_llm = OpenAILlm(model=config.llm.quality_model)
+                quality_llm = OpenAILlm(model=config.llm.quality_model, **retry_kwargs)
 
         store = SqliteStore(config.database_path, embedding_dim=embedder.dimensions)
         raw = RawTranscriptStore(config.raw_dir)
@@ -132,18 +140,59 @@ class MemoryService:
         )
 
     def dream(
-        self, *, trigger: str = "manual", since: str | None = None
+        self, *, trigger: str = "manual", since: str | None = None,
+        max_episodes: int | None = None,
     ) -> _dreaming.DreamReport:
-        """Run a consolidation pass."""
-        return _dreaming.dream(
-            store=self.store,
-            raw=self.raw,
-            embedder=self.embedder,
-            llm=self.llm,
-            quality_llm=self.quality_llm,
-            config=self.config.dream,
-            request=_dreaming.DreamRequest(trigger=trigger, since=since),
-        )
+        """Run a consolidation pass.
+
+        Single-flight: every caller (daemon, CLI, MCP, PreCompact hook) goes
+        through here, so a process-wide pidfile lock guarantees at most one pass
+        at a time. `dream()` selects all pending episodes up front with no
+        per-row claim, so two concurrent passes would double-process the same
+        episodes — wasted LLM spend (painful on a throttled account) and
+        near-duplicate notes. If a pass is already running we skip cleanly
+        rather than pile on. See ADR-0013 / process_lock.py.
+        """
+        lock_path = self.config.home / "dream.pid"
+        # No exe-name check: the real holder is base python (spawned by the
+        # ai-memory.exe / venv launcher), whose path lacks "ai-memory", so a
+        # name check would defeat the lock. See process_lock.py.
+        lock = PidLock(lock_path, expected_name=None)
+        if not lock.acquire():
+            holder = ""
+            with contextlib.suppress(OSError):
+                holder = lock_path.read_text(encoding="utf-8").strip()
+            msg = (
+                "Dream pass skipped: another consolidation pass is already "
+                f"running{f' (pid {holder})' if holder else ''}. "
+                "Single-flight lock prevents concurrent passes from "
+                "double-processing the same episodes."
+            )
+            logger.info(msg)
+            return _dreaming.DreamReport(
+                log_id="skipped",
+                episodes_processed=0,
+                notes_added=0,
+                notes_invalidated=0,
+                notes_promoted_to_profile=0,
+                notes_pruned=0,
+                journal=msg,
+                episodes_failed=0,
+            )
+        try:
+            return _dreaming.dream(
+                store=self.store,
+                raw=self.raw,
+                embedder=self.embedder,
+                llm=self.llm,
+                quality_llm=self.quality_llm,
+                config=self.config.dream,
+                request=_dreaming.DreamRequest(
+                    trigger=trigger, since=since, max_episodes=max_episodes
+                ),
+            )
+        finally:
+            lock.release()
 
     def upsert_profile(self, key: str, value: str, source: str | None = None) -> None:
         """Insert / update a profile fact and re-mirror to profile.md."""

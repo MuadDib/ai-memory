@@ -36,12 +36,20 @@ from pathlib import Path
 
 from ai_memory.config import Config
 from ai_memory.core.service import MemoryService
+from ai_memory.process_lock import process_alive
 from ai_memory.timestamps import now_iso, unix_to_iso
 
 logger = logging.getLogger(__name__)
 
 # How often we wake up to evaluate triggers.
 _POLL_INTERVAL_SECONDS = 60
+
+# Circuit breaker: if this many consecutive passes make no forward progress
+# *and* fail at least one episode (or raise), stop re-firing the same doomed
+# work and back off for the cooldown. Prevents the runaway 63s retry loop that
+# logged 50k+ failed passes when a single episode poison-pilled every attempt.
+_CIRCUIT_BREAKER_THRESHOLD = 3
+_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 3600  # 1 hour
 
 
 @dataclass
@@ -51,6 +59,8 @@ class DaemonRunState:
     last_scheduled_run_date: str | None = None  # 'YYYY-MM-DD' in local time
     last_pressure_run_at: int = 0
     last_idle_run_at: int = 0
+    consecutive_failures: int = 0  # passes that failed/made no progress in a row
+    circuit_open_until: int = 0    # unix time; while now < this, skip all passes
 
 
 class _StopRequested(Exception):
@@ -107,6 +117,19 @@ def _tick(*, service: MemoryService, state: DaemonRunState, log_path: Path) -> N
     now_local = datetime.now()  # naive local time — fine for HH:MM comparison
     now_unix = int(time.time())
 
+    # 0) Circuit breaker open? Skip all work until the cooldown expires.
+    if now_unix < state.circuit_open_until:
+        if now_unix % 600 < _POLL_INTERVAL_SECONDS:
+            _emit(
+                log_path,
+                {
+                    "event": "circuit_open_heartbeat",
+                    "until": unix_to_iso(state.circuit_open_until),
+                    "consecutive_failures": state.consecutive_failures,
+                },
+            )
+        return
+
     # 1) Scheduled trigger
     schedule_str = service.config.dream.schedule_cron
     scheduled_hhmm = _parse_hhmm(schedule_str)
@@ -116,7 +139,7 @@ def _tick(*, service: MemoryService, state: DaemonRunState, log_path: Path) -> N
         and state.last_scheduled_run_date != today_iso
         and (now_local.hour, now_local.minute) >= scheduled_hhmm
     ):
-        _run_pass(service, "scheduled", log_path)
+        _run_pass(service, state, "scheduled", log_path)
         state.last_scheduled_run_date = today_iso
         return
 
@@ -124,7 +147,7 @@ def _tick(*, service: MemoryService, state: DaemonRunState, log_path: Path) -> N
     last_dream_completed = service.store.last_dream_completed_at() or "1970-01-01T00:00:00Z"
     new_turns = service.store.count_turns_since(last_dream_completed)
     if new_turns >= service.config.dream.pressure_trigger_turns:
-        _run_pass(service, "pressure", log_path, extra={"new_turns": new_turns})
+        _run_pass(service, state, "pressure", log_path, extra={"new_turns": new_turns})
         state.last_pressure_run_at = now_unix
         return
 
@@ -141,7 +164,7 @@ def _tick(*, service: MemoryService, state: DaemonRunState, log_path: Path) -> N
         now_unix - state.last_idle_run_at >= idle_threshold_seconds
     )
     if no_recent_turns and has_unconsolidated and enough_gap_since_last_idle:
-        _run_pass(service, "idle", log_path)
+        _run_pass(service, state, "idle", log_path)
         state.last_idle_run_at = now_unix
         return
 
@@ -158,12 +181,35 @@ def _tick(*, service: MemoryService, state: DaemonRunState, log_path: Path) -> N
 
 
 def _run_pass(
-    service: MemoryService, trigger: str, log_path: Path, extra: dict | None = None
+    service: MemoryService,
+    state: DaemonRunState,
+    trigger: str,
+    log_path: Path,
+    extra: dict | None = None,
 ) -> None:
-    """Fire one dream pass and journal the outcome."""
+    """Fire one dream pass, journal the outcome, and update the circuit breaker."""
     started = int(time.time())
     _emit(log_path, {"event": "dream_start", "trigger": trigger, **(extra or {})})
-    report = service.dream(trigger=trigger)
+    try:
+        report = service.dream(trigger=trigger)
+    except Exception as exc:
+        # dream() isolates per-episode failures internally, so reaching here
+        # means something broke around the pass itself. Count it and let the
+        # breaker decide whether to back off.
+        state.consecutive_failures += 1
+        logger.exception("Dream pass (%s) raised: %s", trigger, exc)
+        _emit(
+            log_path,
+            {
+                "event": "dream_error",
+                "trigger": trigger,
+                "error": str(exc)[:500],
+                "consecutive_failures": state.consecutive_failures,
+            },
+        )
+        _maybe_open_circuit(state, log_path)
+        return
+
     _emit(
         log_path,
         {
@@ -171,6 +217,7 @@ def _run_pass(
             "trigger": trigger,
             "log_id": report.log_id,
             "episodes_processed": report.episodes_processed,
+            "episodes_failed": report.episodes_failed,
             "notes_added": report.notes_added,
             "notes_invalidated": report.notes_invalidated,
             "notes_promoted_to_profile": report.notes_promoted_to_profile,
@@ -178,6 +225,35 @@ def _run_pass(
             "duration_seconds": int(time.time()) - started,
         },
     )
+
+    # A "stuck" pass = no episode consolidated AND at least one failed. Repeated
+    # stuck passes trip the breaker; any forward progress resets the counter.
+    if report.episodes_processed == 0 and report.episodes_failed > 0:
+        state.consecutive_failures += 1
+    else:
+        state.consecutive_failures = 0
+    _maybe_open_circuit(state, log_path)
+
+
+def _maybe_open_circuit(state: DaemonRunState, log_path: Path) -> None:
+    """Open the circuit breaker once consecutive failures hit the threshold."""
+    if state.consecutive_failures >= _CIRCUIT_BREAKER_THRESHOLD:
+        state.circuit_open_until = int(time.time()) + _CIRCUIT_BREAKER_COOLDOWN_SECONDS
+        logger.error(
+            "Circuit breaker OPEN after %d consecutive failed/stuck dream passes; "
+            "backing off until %s.",
+            state.consecutive_failures,
+            unix_to_iso(state.circuit_open_until),
+        )
+        _emit(
+            log_path,
+            {
+                "event": "circuit_open",
+                "consecutive_failures": state.consecutive_failures,
+                "until": unix_to_iso(state.circuit_open_until),
+            },
+        )
+        state.consecutive_failures = 0
 
 
 # --- Helpers ----------------------------------------------------------------
@@ -191,77 +267,25 @@ def _emit(log_path: Path, payload: dict) -> None:
         fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
-def _claim_pid(pid_path: Path, expected_name: str = "ai-memory") -> bool:
-    """Atomically claim a pidfile. Returns False if a live ai-memory process already holds it.
+def _claim_pid(pid_path: Path, expected_name: str | None = None) -> bool:
+    """Atomically claim a pidfile. Returns False if a live process already holds it.
 
-    `expected_name` is matched (case-insensitive, substring) against the
-    process executable name so that a recycled PID belonging to an unrelated
-    process (e.g. pwsh) doesn't block startup.
+    `expected_name`, when given, is matched (case-insensitive, substring)
+    against the holder's executable path to survive PID recycling. It defaults
+    to None because the daemon actually runs as base python (the ai-memory.exe /
+    venv launcher spawns it as a child), so a name check of "ai-memory" would
+    never match the live holder and would defeat the lock — see process_lock.py.
     """
     if pid_path.exists():
         try:
             other_pid = int(pid_path.read_text().strip())
-            if _process_alive(other_pid, expected_name=expected_name):
+            if process_alive(other_pid, expected_name=expected_name):
                 return False
         except (ValueError, OSError):
             pass  # stale or unreadable -> we'll overwrite
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text(str(os.getpid()), encoding="utf-8")
     return True
-
-
-def _process_alive(pid: int, expected_name: str | None = None) -> bool:
-    """Cross-platform 'is this pid running' check.
-
-    If `expected_name` is given (case-insensitive substring), the function
-    also verifies that the process executable contains that name.  This
-    guards against PID recycling: a recycled PID held by an unrelated
-    process (e.g. pwsh) looks alive but isn't *our* process.
-    """
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        try:
-            import ctypes
-            import ctypes.wintypes
-
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = ctypes.windll.kernel32.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
-            )
-            if not handle:
-                return False
-            try:
-                if expected_name is not None:
-                    # QueryFullProcessImageNameW to get the exe path
-                    buf = ctypes.create_unicode_buffer(1024)
-                    size = ctypes.wintypes.DWORD(1024)
-                    ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(
-                        handle, 0, buf, ctypes.byref(size)
-                    )
-                    if ok:
-                        exe_path = buf.value.lower()
-                        if expected_name.lower() not in exe_path:
-                            return False  # PID recycled by a different program
-                return True
-            finally:
-                ctypes.windll.kernel32.CloseHandle(handle)
-        except Exception:
-            return False
-    else:
-        try:
-            os.kill(pid, 0)
-            if expected_name is not None:
-                # Best-effort name check via /proc on Linux/macOS
-                try:
-                    exe = os.readlink(f"/proc/{pid}/exe")
-                    if expected_name.lower() not in exe.lower():
-                        return False
-                except OSError:
-                    pass  # /proc not available or unreadable — trust the signal
-            return True
-        except OSError:
-            return False
 
 
 def _install_signal_handlers(stop_event: threading.Event) -> None:

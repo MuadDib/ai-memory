@@ -38,7 +38,7 @@ from pydantic import BaseModel, ValidationError
 from ai_memory.config import DreamConfig
 from ai_memory.core.models import DreamLog, Note, Profile
 from ai_memory.embeddings.interface import Embedder
-from ai_memory.llm.interface import Llm, Message
+from ai_memory.llm.interface import CompletionResult, Llm, Message
 from ai_memory.storage.raw_files import RawTranscriptStore
 from ai_memory.timestamps import iso_to_dt, now_iso
 
@@ -87,6 +87,7 @@ EXTRACT_CHUNK_OVERLAP = 5
 class DreamRequest:
     trigger: str = "manual"  # 'scheduled' | 'idle' | 'pressure' | 'manual'
     since: str | None = None  # ISO 8601 UTC; default: time of last completed dream
+    max_episodes: int | None = None  # cap episodes processed this pass (None = all)
 
 
 @dataclass
@@ -98,6 +99,10 @@ class DreamReport:
     notes_promoted_to_profile: int
     notes_pruned: int
     journal: str
+    # Episodes that raised during Phase 3 and were left pending for retry.
+    # Surfaced so the daemon can trip a circuit breaker on repeated failure
+    # instead of hammering the same doomed work every poll tick.
+    episodes_failed: int = 0
 
 
 @dataclass
@@ -275,21 +280,34 @@ INTEGRATE_VERDICT_SYSTEM = (
 )
 
 PROMOTION_SYSTEM = (
-    "You are a memory consolidation worker. You receive a CLUSTER of related notes. "
-    "Decide whether this cluster describes a STABLE, DURABLE attribute of the user "
-    "(Igor) himself — something that characterises who he is, what he prefers, "
-    "how he works, or what he knows. If yes, output a single key/value pair. "
-    "If no, output null fields.\n\n"
-    "PROMOTE: the user's own preferences, skills, role, tools, habits, style, background.\n"
+    "You are a careful memory consolidation worker deciding what to write into a "
+    "PERMANENT user profile that is loaded into EVERY future conversation. A wrong "
+    "entry silently poisons every future session, so decline unless you are confident.\n\n"
+    "You receive a CLUSTER of related notes. PROMOTE only if the cluster describes a "
+    "STABLE, DURABLE, FIRST-PERSON attribute of the user (Igor) HIMSELF: who he is, "
+    "what he prefers, how he works, what he is skilled in or learning. The fact must "
+    "still be true months from now and its subject must be IGOR — never an external "
+    "company, product, market, news item, promotion, or one-off task.\n\n"
+    "PROMOTE (about Igor): preferred tools / databases / languages, communication "
+    "style, role or seniority, dev environment OS and shell, hobbies, lifestyle, "
+    "what he is currently learning.\n"
     "  Good keys: preferred_database, communication_style, primary_language, "
-    "current_company, dev_environment, learning_language, favourite_sport.\n\n"
-    "DO NOT PROMOTE: facts about external companies, technologies, or entities "
-    "that Igor merely *discussed* or *worked with*. The cluster must say something "
-    "enduring about IGOR, not about the external subject.\n"
-    "  BAD examples: 'British Gas revenue', 'AWS pricing model', "
-    "'PostgreSQL release schedule' — these describe the entity, not Igor.\n\n"
-    'Format: {"key": "snake_case_key", "value": "concise value", "rationale": "why"} '
-    "or null fields if declining. Output ONLY the JSON object."
+    "role, dev_os, learning_language, favourite_sport.\n\n"
+    "DO NOT PROMOTE — return null — for any of these:\n"
+    "  - Facts whose SUBJECT is an external company/product/market Igor merely "
+    "discussed. e.g. 'British Gas runs a Win Your Bill prize draw', 'British Gas "
+    "Trading Limited company number 03078711', 'AWS was 18% of Amazon revenue', "
+    "'AWS pricing model'. These describe the entity, not Igor.\n"
+    "  - Volatile or project-specific implementation detail: file paths, repo "
+    "structure, a project's current architecture, service settings, version "
+    "numbers. e.g. 'ai-memory uses a four-tier model', 'the project venv lives "
+    "under the project directory'. These change and are not durable personal facts.\n"
+    "  - One-off events, tasks, promotions, emails, or troubleshooting steps.\n"
+    "  - Anything where the subject of the fact is not Igor himself.\n\n"
+    "When in doubt, decline. Missing a fact is cheap; poisoning the profile is not.\n"
+    'Format: {"key": "snake_case_key", "value": "concise value", "rationale": '
+    '"why this is a durable fact about Igor"} or {"key": null, "value": null} to '
+    "decline. Output ONLY the JSON object."
 )
 
 
@@ -316,8 +334,12 @@ def dream(
     now = now if now is not None else now_iso()
     log_id = new_id()
 
+    # Journal-on-complete: the dream_log row is written exactly once, at the
+    # END of the pass, fully populated. We deliberately do NOT insert a
+    # placeholder row up front — a pass that died mid-way used to leave an
+    # orphaned row (empty journal, ended_at=NULL), and a poison-pill episode
+    # produced tens of thousands of them, rendering `dream-log` unreadable.
     log = DreamLog(id=log_id, started_at=now, trigger=request.trigger)
-    store.insert_dream_log(log)
 
     # Fetch *all* unconsolidated episodes regardless of when they started.
     # An episode imported via the Cowork importer carries the chat's historical
@@ -336,9 +358,12 @@ def dream(
     else:
         candidate_episodes = store.episodes_since("1970-01-01T00:00:00Z")
     episodes = [ep for ep in candidate_episodes if ep.consolidated_at is None]
+    total_pending = len(episodes)
+    if request.max_episodes is not None:
+        episodes = episodes[: request.max_episodes]
     journal.append(
-        f"Phase 1+2: {len(episodes)} unconsolidated episodes (scanned "
-        f"{len(candidate_episodes)} total)."
+        f"Phase 1+2: processing {len(episodes)} of {total_pending} unconsolidated "
+        f"episodes (scanned {len(candidate_episodes)} total)."
     )
 
     # --- Phase 3: consolidate each episode -----------------------------
@@ -348,140 +373,159 @@ def dream(
     extract_system = _build_extract_system(entity_vocab)
 
     candidate_facts: List[_CandidateFact] = []
+    episodes_consolidated = 0
+    episodes_failed = 0
     for ep in episodes:
         turns = list(store.get_turns_for_episode(ep.id))
         if not turns:
             continue
-        transcript = _render_transcript(raw, turns)
 
-        # Select model: upgrade to quality_llm for long/dense episodes where
-        # better extraction quality is worth the extra cost.
-        long_threshold = config.long_episode_turns if config.long_episode_turns > 0 else 10**9
-        ep_llm = (
-            quality_llm
-            if quality_llm is not None and len(turns) >= long_threshold
-            else llm
-        )
-        if ep_llm is not llm:
-            journal.append(
-                f"  Episode {ep.id}: {len(turns)} turns >= {long_threshold} — "
-                f"using quality model ({ep_llm.model_id}) for Phase 3."
-            )
-
-        # Summary: single-shot on the whole transcript. Synthesising one
-        # paragraph is well within gpt-4o-mini's effective range even at
-        # 60k+ tokens; only enumerative tasks (extract) need chunking.
-        summary_user_msg = (
-            "Summarise the transcript below according to your instructions. "
-            "The conversation has already concluded — do not continue it.\n\n"
-            + transcript
-        )
-        summary_completion = ep_llm.complete(
-            system=SUMMARY_SYSTEM,
-            messages=[Message(role="user", content=summary_user_msg)],
-            max_tokens=1200,
-        )
-        tokens_used += summary_completion.input_tokens + summary_completion.output_tokens
-
-        # Extract: chunked. For short episodes _chunk_turns returns a single
-        # window so behaviour is identical to the old single-shot path.
-        turn_chunks = _chunk_turns(turns)
-        all_facts: List[_ExtractedFact] = []
-        chunk_sizes: List[int] = []
-        chunk_warnings: List[str] = []  # structured failure log (Horcrux: typed failure result)
-        for chunk_turns in turn_chunks:
-            chunk_transcript = _render_transcript(raw, chunk_turns)
-            extract_user_msg = (
-                "Extract atomic facts from the transcript chunk below "
-                "according to your instructions. The conversation has "
-                "already concluded — do not continue it. Output only the "
-                "JSON array.\n\n"
-                + chunk_transcript
-            )
-            chunk_facts, chunk_tokens = _llm_call_with_retry(
-                llm=ep_llm,
-                system=extract_system,
-                user_msg=extract_user_msg,
-                parse_fn=_parse_extract_facts,
-                max_tokens=4000,
-                default=[],
-                warnings=chunk_warnings,
-            )
-            tokens_used += chunk_tokens
-            all_facts.extend(chunk_facts)
-            chunk_sizes.append(len(chunk_facts))
-
-        # Persist summary + mark consolidated only if we produced something.
-        ep.summary = summary_completion.text.strip()
-
-        # Generate a proper short title from the summary.  A tiny dedicated
-        # call (≈10 output tokens on gpt-4o-mini) gives far better results
-        # than slicing the first 80 chars of the paragraph.
-        if ep.summary:
-            title_completion = llm.complete(
-                system=(
-                    "You are given a paragraph summarising a conversation. "
-                    "Write a short title for it: 5-8 words, title case, no "
-                    "punctuation at the end. Output only the title — no quotes, "
-                    "no explanation, nothing else."
-                ),
-                messages=[Message(role="user", content=ep.summary)],
-                max_tokens=25,
-            )
-            tokens_used += title_completion.input_tokens + title_completion.output_tokens
-            ep.title = title_completion.text.strip().strip('"').strip("'") or ep.summary[:80]
-        else:
-            ep.title = ""
-
-        ep.embedding_model = embedder.model_id
-
-        if ep.summary or all_facts:
-            ep.consolidated_at = now
-
+        # Per-episode isolation: one episode failing (rate limit, provider
+        # error, bad data) must never abort the whole pass and block the rest
+        # of the backlog. A failed episode is journalled and left pending
+        # (consolidated_at stays NULL) so a later pass retries it.
         try:
-            [summary_embedding] = embedder.embed([ep.summary]) if ep.summary else [None]  # type: ignore[list-item]
-        except Exception as exc:
-            logger.warning("Failed to embed episode summary %s: %s", ep.id, exc)
-            summary_embedding = None
-        store.update_episode(ep, embedding=summary_embedding)
+            transcript = _render_transcript(raw, turns)
 
-        for fact in all_facts:
-            text = fact.text.strip()
-            if not text:
-                continue
-            # Domain tags: validate against controlled vocabulary, lowercase.
-            # Drop any tag the LLM invented outside the allowed set; always
-            # append the episode source as a provenance tag.
-            raw_tags = [t.lower() for t in fact.tags]
-            tags = [t for t in raw_tags if t in DOMAIN_TAGS] + [ep.source]
-            # Entities: slug-normalise and fuzzy-match against known vocab.
-            entities = [
-                norm for e in fact.entities
-                if (norm := _normalise_entity(e, entity_vocab))
-            ]
-            candidate_facts.append(
-                _CandidateFact(text=text, tags=tags, entities=entities, source_episode_id=ep.id)
+            # Select model: upgrade to quality_llm for long/dense episodes where
+            # better extraction quality is worth the extra cost.
+            long_threshold = (
+                config.long_episode_turns if config.long_episode_turns > 0 else 10**9
             )
+            ep_llm = (
+                quality_llm
+                if quality_llm is not None and len(turns) >= long_threshold
+                else llm
+            )
+            if ep_llm is not llm:
+                journal.append(
+                    f"  Episode {ep.id}: {len(turns)} turns >= {long_threshold} — "
+                    f"using quality model ({ep_llm.model_id}) for Phase 3."
+                )
 
-        ep_candidates = len([f for f in candidate_facts if f.source_episode_id == ep.id])
-        journal.append(
-            f"  Episode {ep.id}: turns={len(turns)} chunks={len(turn_chunks)} "
-            f"transcript_chars={len(transcript)} summary={len(ep.summary)} chars "
-            f"(finish={summary_completion.finish_reason}"
-            f"{', refusal=' + summary_completion.refusal[:120] if summary_completion.refusal else ''}) "
-            f"candidates={ep_candidates} (per-chunk={chunk_sizes})"
-        )
-        if chunk_warnings:
-            # Structured failure log: surface extraction failures directly in the
-            # dream journal so they're visible in `ai-memory dream-log` without
-            # having to grep the Python logger output.
-            for w in chunk_warnings:
-                journal.append(f"    EXTRACT_FAILURE: {w}")
-        if ep_candidates == 0 and not chunk_warnings:
+            # Summary: single-shot when the transcript fits the per-request
+            # token budget; map-reduce (chunk -> merge) when it doesn't. This
+            # guarantees no single request exceeds max_request_tokens, so a
+            # long episode can never produce a permanent "request too large"
+            # 429 (the deadlock this whole change fixes).
+            summary_completion, summary_tokens, summary_mode = _summarise_episode(
+                ep_llm=ep_llm,
+                transcript=transcript,
+                max_request_tokens=config.max_request_tokens,
+            )
+            tokens_used += summary_tokens
+
+            # Extract: chunked. For short episodes _chunk_turns returns a single
+            # window so behaviour is identical to the old single-shot path.
+            turn_chunks = _chunk_turns(turns)
+            all_facts: List[_ExtractedFact] = []
+            chunk_sizes: List[int] = []
+            chunk_warnings: List[str] = []  # structured failure log (Horcrux: typed failure result)
+            for chunk_turns in turn_chunks:
+                chunk_transcript = _render_transcript(raw, chunk_turns)
+                extract_user_msg = (
+                    "Extract atomic facts from the transcript chunk below "
+                    "according to your instructions. The conversation has "
+                    "already concluded — do not continue it. Output only the "
+                    "JSON array.\n\n"
+                    + chunk_transcript
+                )
+                chunk_facts, chunk_tokens = _llm_call_with_retry(
+                    llm=ep_llm,
+                    system=extract_system,
+                    user_msg=extract_user_msg,
+                    parse_fn=_parse_extract_facts,
+                    max_tokens=4000,
+                    default=[],
+                    warnings=chunk_warnings,
+                )
+                tokens_used += chunk_tokens
+                all_facts.extend(chunk_facts)
+                chunk_sizes.append(len(chunk_facts))
+
+            # Persist summary + mark consolidated only if we produced something.
+            ep.summary = summary_completion.text.strip()
+
+            # Generate a proper short title from the summary.  A tiny dedicated
+            # call (≈10 output tokens on gpt-4o-mini) gives far better results
+            # than slicing the first 80 chars of the paragraph.
+            if ep.summary:
+                title_completion = llm.complete(
+                    system=(
+                        "You are given a paragraph summarising a conversation. "
+                        "Write a short title for it: 5-8 words, title case, no "
+                        "punctuation at the end. Output only the title — no quotes, "
+                        "no explanation, nothing else."
+                    ),
+                    messages=[Message(role="user", content=ep.summary)],
+                    max_tokens=25,
+                )
+                tokens_used += title_completion.input_tokens + title_completion.output_tokens
+                ep.title = title_completion.text.strip().strip('"').strip("'") or ep.summary[:80]
+            else:
+                ep.title = ""
+
+            ep.embedding_model = embedder.model_id
+
+            if ep.summary or all_facts:
+                ep.consolidated_at = now
+
+            try:
+                [summary_embedding] = embedder.embed([ep.summary]) if ep.summary else [None]  # type: ignore[list-item]
+            except Exception as exc:
+                logger.warning("Failed to embed episode summary %s: %s", ep.id, exc)
+                summary_embedding = None
+            store.update_episode(ep, embedding=summary_embedding)
+
+            this_ep_facts: List[_CandidateFact] = []
+            for fact in all_facts:
+                text = fact.text.strip()
+                if not text:
+                    continue
+                # Domain tags: validate against controlled vocabulary, lowercase.
+                # Drop any tag the LLM invented outside the allowed set; always
+                # append the episode source as a provenance tag.
+                raw_tags = [t.lower() for t in fact.tags]
+                tags = [t for t in raw_tags if t in DOMAIN_TAGS] + [ep.source]
+                # Entities: slug-normalise and fuzzy-match against known vocab.
+                entities = [
+                    norm for e in fact.entities
+                    if (norm := _normalise_entity(e, entity_vocab))
+                ]
+                this_ep_facts.append(
+                    _CandidateFact(text=text, tags=tags, entities=entities, source_episode_id=ep.id)
+                )
+            candidate_facts.extend(this_ep_facts)
+
+            if ep.consolidated_at == now:
+                episodes_consolidated += 1
+
             journal.append(
-                "    note: 0 candidate facts extracted — "
-                "short episode, parse failure (see logs), or all facts deduplicated"
+                f"  Episode {ep.id}: turns={len(turns)} chunks={len(turn_chunks)} "
+                f"transcript_chars={len(transcript)} summary={len(ep.summary)} chars "
+                f"(mode={summary_mode} finish={summary_completion.finish_reason}"
+                f"{', refusal=' + summary_completion.refusal[:120] if summary_completion.refusal else ''}) "
+                f"candidates={len(this_ep_facts)} (per-chunk={chunk_sizes})"
             )
+            if chunk_warnings:
+                # Structured failure log: surface extraction failures directly in the
+                # dream journal so they're visible in `ai-memory dream-log` without
+                # having to grep the Python logger output.
+                for w in chunk_warnings:
+                    journal.append(f"    EXTRACT_FAILURE: {w}")
+            if len(this_ep_facts) == 0 and not chunk_warnings:
+                journal.append(
+                    "    note: 0 candidate facts extracted — "
+                    "short episode, parse failure (see logs), or all facts deduplicated"
+                )
+        except Exception as exc:  # isolate the failure to this episode
+            episodes_failed += 1
+            logger.exception("Episode %s failed in Phase 3: %s", ep.id, exc)
+            journal.append(
+                f"  Episode {ep.id}: EPISODE_FAILURE in Phase 3 — "
+                f"{type(exc).__name__}: {str(exc)[:200]}. Left pending for retry."
+            )
+            continue
 
     # --- Phase 4: integrate candidate facts ----------------------------
     integrated, phase4_tokens = _phase4_integrate(
@@ -503,6 +547,7 @@ def dream(
         config=config,
         now=now,
         journal=journal,
+        quality_llm=quality_llm,
     )
     tokens_used += phase5_tokens
 
@@ -510,25 +555,30 @@ def dream(
     pruned = _phase6_prune(store=store, config=config, now=now, journal=journal)
 
     # --- Phase 7: journal ----------------------------------------------
-    journal.append(f"LLM tokens used this pass: {tokens_used} ({llm.model_id})")
+    journal.append(
+        f"Pass complete: {episodes_consolidated} episodes consolidated, "
+        f"{episodes_failed} failed (left pending). "
+        f"LLM tokens used this pass: {tokens_used} ({llm.model_id})"
+    )
     log.ended_at = now_iso()
-    log.episodes_processed = len(episodes)
+    log.episodes_processed = episodes_consolidated
     log.notes_added = notes_added
     log.notes_invalidated = notes_invalidated
     log.notes_promoted_to_profile = promoted
     log.notes_pruned = pruned
     log.llm_tokens_used = tokens_used
     log.journal = "\n".join(journal)
-    store.update_dream_log(log)
+    store.insert_dream_log(log)
 
     return DreamReport(
         log_id=log_id,
-        episodes_processed=len(episodes),
+        episodes_processed=episodes_consolidated,
         notes_added=notes_added,
         notes_invalidated=notes_invalidated,
         notes_promoted_to_profile=promoted,
         notes_pruned=pruned,
         journal=log.journal,
+        episodes_failed=episodes_failed,
     )
 
 
@@ -667,6 +717,7 @@ def _phase5_promote(
     config: DreamConfig,
     now: str,
     journal: List[str],
+    quality_llm: "Llm | None" = None,
 ) -> Tuple[int, int]:
     """Find recurring fact clusters and promote them to the profile.
 
@@ -707,7 +758,7 @@ def _phase5_promote(
         # Ask the LLM whether this cluster is worth promoting and what key/value to use.
         cluster_payload = [{"id": n.id, "text": n.text} for n in cluster]
         promotion, promo_tokens = _llm_call_with_retry(
-            llm=llm,
+            llm=quality_llm or llm,
             system=PROMOTION_SYSTEM,
             user_msg=json.dumps(cluster_payload, ensure_ascii=False),
             parse_fn=_parse_promotion,
@@ -885,6 +936,106 @@ def _render_transcript(raw: RawTranscriptStore, turns: Iterable) -> str:
         lines.append("</turn>")
     lines.append("</conversation_transcript>")
     return "\n".join(lines)
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate (~4 chars per token). Good enough to decide chunking."""
+    return len(text) // 4
+
+
+def _split_transcript_by_budget(transcript: str, budget_chars: int) -> List[str]:
+    """Split a rendered transcript into <=budget_chars pieces at turn boundaries.
+
+    Cuts happen between `</turn>` markers so a single turn is never split across
+    two requests. A pathologically large single turn may still exceed the budget
+    on its own; that's acceptable — it's one turn, not a 142k-token episode.
+    """
+    if budget_chars <= 0 or len(transcript) <= budget_chars:
+        return [transcript]
+    # Re-attach the `</turn>` delimiter to every fragment except a trailing
+    # empty one, so "".join(segments) == transcript exactly (no spurious tag).
+    parts = transcript.split("</turn>")
+    segments: List[str] = []
+    for i, block in enumerate(parts):
+        if i < len(parts) - 1:
+            segments.append(block + "</turn>")
+        elif block:
+            segments.append(block)
+    pieces: List[str] = []
+    current = ""
+    for segment in segments:
+        if current and len(current) + len(segment) > budget_chars:
+            pieces.append(current)
+            current = segment
+        else:
+            current += segment
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def _summarise_episode(
+    *,
+    ep_llm: "Llm",
+    transcript: str,
+    max_request_tokens: int,
+) -> "Tuple[CompletionResult, int, str]":
+    """Summarise an episode without exceeding the per-request token budget.
+
+    Returns (final_completion, total_tokens_used, mode). `mode` is 'single-shot'
+    when the transcript fits the budget, otherwise 'map-reduce(N chunks)': each
+    chunk is summarised and the partial summaries are merged. This guarantees no
+    single request exceeds max_request_tokens, so a long episode can never
+    trigger a permanent 'request too large' 429 — the root cause of the deadlock.
+    """
+    if _estimate_tokens(transcript) <= max_request_tokens:
+        completion = ep_llm.complete(
+            system=SUMMARY_SYSTEM,
+            messages=[Message(role="user", content=(
+                "Summarise the transcript below according to your instructions. "
+                "The conversation has already concluded — do not continue it.\n\n"
+                + transcript
+            ))],
+            max_tokens=1200,
+        )
+        return completion, completion.input_tokens + completion.output_tokens, "single-shot"
+
+    # Map: summarise each chunk separately (each well under the budget).
+    budget_chars = max(1, max_request_tokens) * 4
+    chunks = _split_transcript_by_budget(transcript, budget_chars)
+    total_tokens = 0
+    partials: List[str] = []
+    for index, chunk in enumerate(chunks, start=1):
+        c = ep_llm.complete(
+            system=SUMMARY_SYSTEM,
+            messages=[Message(role="user", content=(
+                f"This is PART {index} of {len(chunks)} of a long transcript whose "
+                "conversation has already concluded — do not continue it. "
+                "Summarise only what happens in this part, according to your "
+                "instructions.\n\n"
+                + chunk
+            ))],
+            max_tokens=600,
+        )
+        total_tokens += c.input_tokens + c.output_tokens
+        if c.text.strip():
+            partials.append(c.text.strip())
+
+    # Reduce: merge the partial summaries into one coherent paragraph.
+    merged_input = "\n\n".join(f"[Part {i}] {p}" for i, p in enumerate(partials, start=1))
+    final = ep_llm.complete(
+        system=SUMMARY_SYSTEM,
+        messages=[Message(role="user", content=(
+            "Below are ordered partial summaries of consecutive parts of one "
+            "conversation that has already concluded. Merge them into a single "
+            "coherent summary according to your instructions — do not continue "
+            "the conversation.\n\n"
+            + merged_input
+        ))],
+        max_tokens=1200,
+    )
+    total_tokens += final.input_tokens + final.output_tokens
+    return final, total_tokens, f"map-reduce({len(chunks)} chunks)"
 
 
 def _llm_call_with_retry(

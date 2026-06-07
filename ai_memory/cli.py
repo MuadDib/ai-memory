@@ -34,6 +34,17 @@ from ai_memory.core.service import MemoryService
 from ai_memory.timestamps import iso_to_dt
 from ai_memory.transport.mcp_server import serve_mcp
 
+# Windows consoles default to legacy cp1252; dream journals, episode summaries,
+# and LLM-extracted notes routinely contain Unicode (→, em dashes, smart quotes).
+# Reconfigure stdout/stderr to UTF-8 so click.echo can't die mid-print with a
+# UnicodeEncodeError — which previously masked an otherwise-successful dream pass
+# (the pass committed, then printing its journal crashed the process with exit 1).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except (AttributeError, ValueError):
+        pass  # stream not reconfigurable (e.g. wrapped under pytest capture) — fine
+
 
 def _setup_logging(level: str) -> None:
     logging.basicConfig(
@@ -95,8 +106,10 @@ def bootstrap(config, chatgpt_path, claude_path):
               type=click.Choice(["manual", "scheduled", "idle", "pressure"]))
 @click.option("--watch", is_flag=True,
               help="Run as a long-lived daemon. Fires dream() on schedule, idle, or pressure.")
+@click.option("--max-episodes", default=None, type=int,
+              help="Process at most N pending episodes this pass (for batched/resumable backfills).")
 @click.pass_obj
-def dream(config, trigger, watch):
+def dream(config, trigger, watch, max_episodes):
     """Run a dream-cycle pass once, or as a watching daemon."""
     if watch:
         from ai_memory.daemon import run_watch
@@ -105,7 +118,7 @@ def dream(config, trigger, watch):
     service = MemoryService.build(config)
     service.start()
     try:
-        report = service.dream(trigger=trigger)
+        report = service.dream(trigger=trigger, max_episodes=max_episodes)
         click.echo(f"dream {report.log_id}: episodes={report.episodes_processed} "
                    f"notes_added={report.notes_added} pruned={report.notes_pruned}")
         click.echo("--- journal ---")

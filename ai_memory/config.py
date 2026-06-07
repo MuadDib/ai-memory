@@ -62,6 +62,17 @@ class DreamConfig:
     # Turn count at or above which the quality_model is used for Phase 3
     # extraction on that episode.  0 = never upgrade.
     long_episode_turns: int = 100
+    # Hard ceiling on the input size (in tokens, ~4 chars each) of any single
+    # Phase 3 LLM request.  Transcripts larger than this are summarised
+    # map-reduce (chunk -> merge) instead of single-shot, so one long episode
+    # can never emit a request bigger than the provider's per-minute token
+    # limit (a 142k-token request to a 30k-TPM model is a permanent 429).
+    # Keep this comfortably under the selected model's TPM ceiling.
+    max_request_tokens: int = 25000
+    # Transient-429 backoff: how many times a single LLM call retries on a
+    # rate-limit before giving up, and the base seconds for exponential backoff.
+    rate_limit_max_retries: int = 5
+    rate_limit_backoff_seconds: float = 2.0
 
 
 @dataclass(frozen=True)

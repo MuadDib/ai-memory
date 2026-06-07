@@ -18,6 +18,7 @@ from ai_memory.core.dreaming import (
     _cluster_notes,
     _euclid_distance,
     _chunk_turns,
+    _estimate_tokens,
     _llm_call_with_retry,
     _parse_extract_facts,
     _parse_promotion,
@@ -26,6 +27,8 @@ from ai_memory.core.dreaming import (
     _safe_parse_facts,
     _safe_parse_json,
     _sanitise_profile_key,
+    _split_transcript_by_budget,
+    _summarise_episode,
     DUPLICATE_DIST_BELOW,
     UNRELATED_DIST_ABOVE,
 )
@@ -221,6 +224,61 @@ def test_chunk_turns_exact_multiple() -> None:
     chunks = _chunk_turns(turns, chunk_size=50, overlap=5)
     assert len(chunks) == 1
     assert chunks[0] == turns
+
+
+# --- Summary token budgeting (deadlock fix) ---------------------------------
+
+
+def test_estimate_tokens_roughly_quarter_of_chars() -> None:
+    assert _estimate_tokens("") == 0
+    assert _estimate_tokens("a" * 400) == 100
+
+
+def test_split_transcript_small_returns_single_piece() -> None:
+    transcript = "<turn n=1 role=user>hello</turn>"
+    assert _split_transcript_by_budget(transcript, budget_chars=1000) == [transcript]
+
+
+def test_split_transcript_breaks_at_turn_boundaries_under_budget() -> None:
+    turns = "".join(f"<turn n={i} role=user>{'x' * 40}</turn>" for i in range(10))
+    pieces = _split_transcript_by_budget(turns, budget_chars=120)
+    # Every piece is under (or equal to) budget except an unavoidable single turn.
+    assert len(pieces) > 1
+    for piece in pieces:
+        assert len(piece) <= 120 or piece.count("<turn") == 1
+    # Reassembly preserves every turn (no turn dropped or split mid-tag).
+    assert "".join(pieces) == turns
+    assert sum(p.count("<turn") for p in pieces) == 10
+
+
+def test_summarise_episode_single_shot_when_small() -> None:
+    """A small transcript = one LLM call, mode single-shot."""
+    llm = _mock_llm("a concise summary")
+    completion, tokens, mode = _summarise_episode(
+        ep_llm=llm, transcript="<turn n=1 role=user>hi</turn>", max_request_tokens=25000
+    )
+    assert mode == "single-shot"
+    assert completion.text == "a concise summary"
+    assert tokens == 15  # 10 in + 5 out from _mock_llm
+    assert llm.complete.call_count == 1
+
+
+def test_summarise_episode_map_reduce_when_over_budget() -> None:
+    """A transcript over budget is chunk-summarised then merged (map-reduce)."""
+    transcript = "".join(f"<turn n={i} role=user>{'x' * 80}</turn>" for i in range(40))
+    # Derive the real chunk count so the mock supplies exactly enough responses:
+    # one per map call plus the final merge.
+    chunks = _split_transcript_by_budget(transcript, 100 * 4)
+    assert len(chunks) > 1  # sanity: this transcript really does need splitting
+    llm = _mock_llm(*[f"part {i}" for i in range(len(chunks))], "merged summary")
+    completion, tokens, mode = _summarise_episode(
+        ep_llm=llm, transcript=transcript, max_request_tokens=100
+    )
+    assert mode == f"map-reduce({len(chunks)} chunks)"
+    assert completion.text == "merged summary"
+    # One call per chunk (map) + one merge (reduce); tokens summed across all.
+    assert llm.complete.call_count == len(chunks) + 1
+    assert tokens == 15 * (len(chunks) + 1)
 
 
 # --- Pydantic parse functions -----------------------------------------------
