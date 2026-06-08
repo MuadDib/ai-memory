@@ -217,6 +217,36 @@ is exactly what proposal §12 warns against).
         cross-encoder rerank / grounding items, **not** by dedup. Net: dedup was the
         right call for corpus hygiene and contradiction cleanup, but it is not a
         recall lever.
+- [x] **Recall-quality levers #1–#4 (2026-06-08)** — since dedup wasn't the lever,
+      attacked the ranking problem directly. Measured on the live corpus via
+      `scripts/eval_recall_variants.py` (runs the suite under each config variant):
+
+      | variant | recall@k | Δ |
+      |---|---|---|
+      | post-dedup, pre-changes | 20/27 (74.1%) | — |
+      | **#3 conviction boost (on by default)** | **22/27 (81.5%)** | **+2** |
+      | + #1 LLM rerank (opt-in) | 23/27 (85.2%) | +1 (fixes `murphy-bed`) |
+      | + #2 HyDE (opt-in) | 22/27 (81.5%) | **+0 (no help on this suite)** |
+
+      - **#3 conviction-aware ranking** — corroboration (source episodes) +
+        reinforcement (access_count), log-scaled, applied at merge. The big, free
+        win; **on by default** (`recall.conviction_weight=0.2`). Recovered past the
+        pre-dedup 77.8% baseline.
+      - **#1 LLM cross-encoder rerank** — re-scores the top-20 fused pool. Adds one
+        case but costs an LLM call per recall, so **opt-in** (`recall.rerank_enabled`)
+        per the hot-path rule.
+      - **#2 HyDE** — embed a hypothetical answer instead of the question. Implemented
+        + fail-safe, but **no measurable lift on this suite**; left **opt-in**
+        (`recall.hyde_enabled`), off by default. (May help other query shapes; no
+        evidence yet.)
+      - **#4 floor tuning** — checked the live distance distribution: notes cluster at
+        L2 0.56–0.87, well under the 1.1 floor, and the remaining failures are
+        *retrieved but low-ranked / not in the fused pool*, not filtered out. So the
+        floor is **not** the lever; left at 1.1. (`final_score_floor` stays 0.)
+      - Still failing (4): `backend-language`, `frontend-framework`, `user-origin`,
+        `user-role` — the right note isn't in the top-20 fused pool, so rerank can't
+        reach it. This is a *retrieval/embedding* gap (a better embedder or the
+        grounding/data work below), not a ranking one.
 - [ ] **Extraction grounding gate**: embed each extracted fact, drop those far from
       their source chunk (keeps British-Gas-promo / "AWS Durable Functions"
       hallucinations out of Tier 1). Threshold must be read off the real
