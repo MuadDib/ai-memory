@@ -54,12 +54,45 @@ logger = logging.getLogger(__name__)
 # sqlite-vec returns L2 distance for unit vectors; sim ~ 1 - dist/2. We compare on
 # the *distance* directly so we don't have to assume normalization — smaller is
 # more similar.
-DUPLICATE_DIST_BELOW = 0.10   # essentially identical -> dedup without LLM
-# Lowered from 0.20: facts that differ only in a value (port number, version,
-# tool name) sit in the 0.10–0.20 band and must reach the LLM so that
-# "port 8080 → port 9000" and "PostgreSQL → MySQL" are caught as CONTRADICTS
-# rather than silently short-circuited as duplicates.
-UNRELATED_DIST_ABOVE = 0.55   # clearly unrelated -> insert without LLM
+#
+# 2026-06-07 eval-driven re-measurement (drained corpus, text-embedding-3-small,
+# unit vectors, 1907 valid notes — see remediation plan P1 "Tune Phase 4 dedup"):
+# short English fact statements compress into a much narrower distance band than
+# the old 0.10/0.55 split assumed. Controlled probe pairs:
+#   identical text                                    -> 0.00
+#   same fact, reworded ("drinks tea" vs "tea, not coffee") -> 0.87
+#   same fact, richer context                         -> 0.64
+#   CONTRADICTS (port 8080 vs port 9000)              -> 0.63
+#   same topic, different subject (Igor/Emily, both "lives in London") -> 1.09
+#   genuinely unrelated                               -> 1.41
+# and the corpus's own nearest-neighbour distance distribution sits at
+# min=0.56 / median=0.80 / p75=0.90. Live near-dup clusters already in storage
+# (Citywire-role, WSL-environment, London-residency, tea-preference) measured
+# pairwise at 0.55–1.06 — i.e. ABOVE the old UNRELATED_DIST_ABOVE=0.55, so they
+# were classified "clearly unrelated" and inserted without ever reaching the LLM
+# verdict. That mis-set ceiling — not DUPLICATE_DIST_BELOW — is *why* those
+# clusters built up: paraphrased duplicates and contradictions both land well
+# above 0.55, indistinguishable from each other by distance alone (0.87 vs 0.63).
+# Only the LLM verdict can tell them apart; the pre-filters can only decide
+# whether it's worth asking.
+DUPLICATE_DIST_BELOW = 0.15   # near-byte-identical text only -> dedup without LLM
+# Raised slightly from 0.10, but kept low and treated as a cheap optimisation,
+# NOT a semantic-dedup mechanism: real paraphrased duplicates sit at 0.6-0.9,
+# far above any safe auto-dedup line (auto-deduping there would also swallow
+# genuine CONTRADICTS pairs, which measure even closer at ~0.63). This band
+# only catches whitespace/punctuation-level rephrasings; everything else must
+# go through the LLM verdict below.
+UNRELATED_DIST_ABOVE = 1.05   # clearly unrelated -> insert without LLM
+# Raised from 0.55 (which sat *below* the corpus's nearest-neighbour floor of
+# 0.56, so almost nothing was ever filtered as "related" — Phase 4's LLM check
+# was nearly dead code). 1.05 sits just below the measured "different subject,
+# same topic" pair (1.09) and "genuinely unrelated" pair (1.41), while still
+# routing real near-dups (<=0.9), CONTRADICTS (~0.63) and "same domain,
+# different fact" (~1.0) candidates into the LLM verdict where they belong.
+# Trade-off: this means *most* candidates now reach the LLM (median NN distance
+# is 0.80, well inside the band) — a real per-pass cost increase on the
+# rate-limited account, but it's the only way to get real semantic dedup with
+# this embedding model's compressed distance range for short factual English.
 INTEGRATE_NEIGHBOURS = 5      # how many existing notes to compare a candidate against
 
 # Phase 5 — promotion clustering.
@@ -136,6 +169,13 @@ class _PromotionResult(BaseModel):
     key: str | None = None
     value: str | None = None
     rationale: str = ""
+
+
+class _CoverageResult(BaseModel):
+    """ADR-0014 §3 partial-information check: does the NEW fact fully preserve the
+    still-valid content of the OLD fact, so OLD can be safely discarded?"""
+    fully_superseded: bool
+    reason: str = ""
 
 
 _T = TypeVar("_T")
@@ -271,12 +311,50 @@ INTEGRATE_VERDICT_SYSTEM = (
     "Do NOT label as DUPLICATE when the value has changed — that is CONTRADICTS.\n"
     "Different subjects or compatible parallel facts are NOT contradictions "
     "(two services on different ports, two projects in different regions).\n\n"
+    "SAME-SCOPE REQUIREMENT — a contradiction needs the SAME subject, attribute, "
+    "scope, timeframe, and object. If the two facts differ in ANY of the following, "
+    "they are NOT a contradiction — use COMPLEMENTS or UNRELATED:\n"
+    "  - different TIMEFRAME: 'AWS was 17% in Q4 2025' vs 'AWS was 18% in 2025' "
+    "(a quarter is not the full year) → not a contradiction\n"
+    "  - different OBJECT / variant: 'OpenRun Pro maxes at 89 dB' vs 'OpenRun maxes "
+    "at 85 dB' (different products) → not a contradiction\n"
+    "  - different ENTITY: 'Roald Dahl's bibliography' vs 'Robert Dahl's bibliography' "
+    "(different people) → not a contradiction\n"
+    "  - GENERAL principle vs SPECIFIC instance: 'UK walls are usually 400mm, "
+    "sometimes 600mm' vs 'this wall is 600mm' → not a contradiction\n"
+    "  - two SEPARATE measurements / events: 'a dream pass used 127k tokens' vs "
+    "'a dream pass used 150022 tokens' (different runs) → not a contradiction\n"
+    "Only assert CONTRADICTS when the SAME thing, measured the SAME way, at the SAME "
+    "scope, now genuinely has a different value.\n\n"
     "COMPLEMENTS — adds genuinely new information not inferable from the existing note.\n\n"
     "UNRELATED — completely different topic.\n\n"
     "Bias DUPLICATE over COMPLEMENTS when the underlying value is the same. "
     "Use CONTRADICTS whenever the value of an existing attribute has clearly changed.\n"
     'Output JSON: [{"existing_id": "...", "verdict": "DUPLICATE|CONTRADICTS|COMPLEMENTS|UNRELATED", "reason": "..."}]. '
     "Output ONLY the JSON array, no prose."
+)
+
+SUPERSEDE_COVERAGE_SYSTEM = (
+    "You are a memory-consolidation SAFETY CHECK. A NEW fact has been judged to "
+    "contradict and replace an OLD fact, and the OLD fact is about to be deleted. "
+    "Your job is to prevent the loss of any still-true information.\n\n"
+    "Decide: does the NEW fact preserve ALL the still-valid information in the OLD "
+    "fact, so the OLD fact can be safely discarded? Only the single value being "
+    "corrected may differ; EVERYTHING ELSE asserted by OLD must also be present in "
+    "NEW. If OLD contains any additional attribute, qualifier, or related fact that "
+    "NEW does not restate, answer false — both must be kept.\n\n"
+    "Examples:\n"
+    "  OLD='SQLite uses WAL mode and a 15s busy_timeout' "
+    "NEW='busy_timeout set to 5000ms' → false (NEW drops the WAL-mode fact)\n"
+    "  OLD='service runs on port 8080' NEW='service runs on port 9000' "
+    "→ true (NEW fully restates OLD with only the corrected value)\n"
+    "  OLD='Igor works at Citywire as a team lead' NEW='Igor left Citywire' "
+    "→ false (NEW drops the role detail)\n"
+    "  OLD='Python 3.11' NEW='upgraded to Python 3.12' → true\n\n"
+    "When unsure, answer false — keeping a redundant note is cheap; deleting a "
+    "still-true fact is not.\n"
+    'Output JSON: {"fully_superseded": true|false, "reason": "..."}. '
+    "Output ONLY the JSON object."
 )
 
 PROMOTION_SYSTEM = (
@@ -321,6 +399,7 @@ def dream(
     embedder: Embedder,
     llm: Llm,
     quality_llm: "Llm | None" = None,
+    confirm_llm: "Llm | None" = None,
     config: DreamConfig,
     request: DreamRequest,
     now: str | None = None,
@@ -330,6 +409,10 @@ def dream(
     `quality_llm`: when set, episodes with >= `config.long_episode_turns` turns
     use this LLM for Phase 3 (summary + extract) where extraction quality
     matters most.  Phase 4 and Phase 5 always use the base `llm`.
+
+    `confirm_llm`: when set (ADR-0014 §2), a Phase 4 CONTRADICTS verdict only
+    SUPERSEDES the existing note if this second model also agrees; otherwise the
+    pair is quarantined. When None, ALL contradictions are quarantined.
     """
     now = now if now is not None else now_iso()
     log_id = new_id()
@@ -533,12 +616,27 @@ def dream(
         store=store,
         embedder=embedder,
         llm=llm,
+        confirm_llm=confirm_llm,
         now=now,
         journal=journal,
     )
     notes_added += integrated["added"]
     notes_invalidated += integrated["invalidated"]
     tokens_used += phase4_tokens
+
+    # --- Phase 4b: conviction-gated resolution of quarantined ----------
+    # contradictions (ADR-0014 §5). Off unless explicitly enabled; reuses the
+    # cross-model confirmer when available, else the base llm.
+    if config.resolve_contradictions:
+        resolved, phase4b_tokens = _phase4b_resolve_contradictions(
+            store=store,
+            judge=confirm_llm or llm,
+            config=config,
+            now=now,
+            journal=journal,
+        )
+        notes_invalidated += resolved
+        tokens_used += phase4b_tokens
 
     # --- Phase 5: promote recurring patterns ---------------------------
     promoted, phase5_tokens = _phase5_promote(
@@ -585,27 +683,55 @@ def dream(
 # --- Phase 4 ---------------------------------------------------------------
 
 
+def _blocks_preference_override(existing_tags: List[str], candidate_tags: List[str]) -> bool:
+    """True when a DUPLICATE/CONTRADICTS verdict should be overridden to insert-as-new.
+
+    A note tagged ``preference`` encodes one of Igor's standing values — it
+    should only ever be merged into or superseded by another statement of a
+    preference, never by an episodic note (problem/workflow/project/fix) that
+    merely *mentions* the same topic. The 2026-06-07 consolidation dry-run
+    review found this exact asymmetry was a systematic, repeatable LLM bias
+    (conflating "an event happened that deviates from a preference" with "the
+    preference changed") that survived even gpt-4o + an independent adversarial
+    second opinion: 4/4 sampled verdicts where a non-preference note challenged
+    a preference note were wrong (including one that would have permanently
+    destroyed a true standing preference); 0/3 preference-vs-preference
+    verdicts were. This is a cheap structural gate using metadata the extract
+    step already assigns — no extra LLM calls, and it closes a bias that
+    re-querying the same judge demonstrably does not.
+    """
+    return "preference" in existing_tags and "preference" not in candidate_tags
+
+
 def _phase4_integrate(
     *,
     candidates: List[_CandidateFact],
     store: "MemoryStore",
     embedder: Embedder,
     llm: Llm,
+    confirm_llm: "Llm | None" = None,
     now: str,
     journal: List[str],
 ) -> Tuple[dict, int]:
     """Integrate candidate facts: dedup, contradict-resolve, insert.
 
-    Returns ({added, invalidated, deduped}, llm_tokens_used).
+    `confirm_llm` (ADR-0014 §2): a CONTRADICTS verdict only supersedes the
+    existing note when this second model also returns CONTRADICTS for the same
+    note; otherwise the pair is quarantined (both kept, linked). None → all
+    contradictions quarantined.
+
+    Returns ({added, invalidated, deduped, quarantined}, llm_tokens_used).
     """
     added = 0
     invalidated = 0
     deduped = 0
+    quarantined = 0
     tokens = 0
 
     if not candidates:
         journal.append("Phase 4: no candidate facts to integrate.")
-        return {"added": added, "invalidated": invalidated, "deduped": deduped}, tokens
+        return {"added": added, "invalidated": invalidated,
+                "deduped": deduped, "quarantined": quarantined}, tokens
 
     # Embed all candidates in one batch — single API call instead of N.
     candidate_embeddings = embedder.embed([c.text for c in candidates])
@@ -636,21 +762,84 @@ def _phase4_integrate(
 
         action_taken = False
         for v in verdicts:
+            if v.verdict not in ("DUPLICATE", "CONTRADICTS"):
+                continue
+            # The LLM occasionally returns an existing_id that doesn't match any
+            # of the neighbours it was shown — ignore those rather than crashing.
+            existing_note = next((n for n, _ in neighbours if n.id == v.existing_id), None)
+            if existing_note is None:
+                journal.append(
+                    f"Phase 4: verdict referenced unknown existing_id {v.existing_id!r} "
+                    f"— ignoring that verdict"
+                )
+                continue
+            if _blocks_preference_override(existing_note.tags, cand.tags):
+                journal.append(
+                    f"Phase 4: preference-protection gate overrode {v.verdict} "
+                    f"of {v.existing_id} (tags={existing_note.tags}) by "
+                    f"non-preference candidate (tags={cand.tags}) -> inserting as new"
+                )
+                continue
             if v.verdict == "DUPLICATE":
                 store.bump_note_access(v.existing_id, now)
                 deduped += 1
                 action_taken = True
                 break  # done with this candidate
-            if v.verdict == "CONTRADICTS":
-                # Insert the new fact, then invalidate the old one and link them.
-                inserted_id = _insert_candidate(
-                    store, cand, cand_emb, embedder, now, contradicts=[v.existing_id]
+            # CONTRADICTS (ADR-0014): a single contradicting mention must not
+            # destroy a standing fact unattended — the 2026-06-08 retro pass found
+            # ~67% of the primary judge's contradictions were false. Supersede the
+            # existing note ONLY if a second, ideally different-family model also
+            # confirms the contradiction (§2 cross-model). Otherwise quarantine:
+            # insert the new fact linked to the existing one, keep BOTH valid, and
+            # defer resolution to the conviction gate / review digest (§5/§6).
+            confirmed = False
+            partial_info = False
+            if confirm_llm is not None:
+                confirmed, ctok = _confirm_contradiction(
+                    confirm_llm=confirm_llm, candidate_text=cand.text,
+                    existing=existing_note,
                 )
+                tokens += ctok
+                if confirmed:
+                    # §3 partial-information guard: even a cross-model-confirmed
+                    # contradiction must not destroy the old note if the new one
+                    # omits a still-true fact bundled into it (e.g. superseding a
+                    # stale timeout would also delete a WAL-mode fact). If the new
+                    # fact does not fully cover the old, downgrade to quarantine.
+                    clean, stok = _new_supersedes_cleanly(
+                        llm=confirm_llm, new_text=cand.text,
+                        old_text=existing_note.text,
+                    )
+                    tokens += stok
+                    if not clean:
+                        confirmed = False
+                        partial_info = True
+            inserted_id = _insert_candidate(
+                store, cand, cand_emb, embedder, now, contradicts=[v.existing_id]
+            )
+            added += 1
+            if confirmed:
                 store.invalidate_note(v.existing_id, when=now, superseded_by=inserted_id)
                 invalidated += 1
-                added += 1
-                action_taken = True
-                break
+                journal.append(
+                    f"Phase 4: CONTRADICTS confirmed cross-model + full coverage — "
+                    f"superseded {v.existing_id} with new {inserted_id} (ADR-0014 §2/§3)"
+                )
+            else:
+                quarantined += 1
+                if partial_info:
+                    why = "partial information — old note has facts the new one omits"
+                elif confirm_llm is not None:
+                    why = "second model disagreed"
+                else:
+                    why = "no cross-model confirmer configured"
+                journal.append(
+                    f"Phase 4: CONTRADICTS quarantined ({why}) — kept both existing "
+                    f"{v.existing_id} and new {inserted_id}; contradicts link "
+                    f"recorded, neither invalidated (ADR-0014)"
+                )
+            action_taken = True
+            break
 
         if not action_taken:
             # Either UNRELATED or COMPLEMENTS for everything — insert.
@@ -659,9 +848,157 @@ def _phase4_integrate(
 
     journal.append(
         f"Phase 4: integrated {len(candidates)} candidates -> "
-        f"added={added}, invalidated={invalidated}, deduped={deduped}"
+        f"added={added}, invalidated={invalidated}, deduped={deduped}, "
+        f"quarantined={quarantined}"
     )
-    return {"added": added, "invalidated": invalidated, "deduped": deduped}, tokens
+    return {"added": added, "invalidated": invalidated, "deduped": deduped,
+            "quarantined": quarantined}, tokens
+
+
+def _confirm_contradiction(
+    *, confirm_llm: Llm, candidate_text: str, existing: Note
+) -> Tuple[bool, int]:
+    """ADR-0014 §2: ask a second, independent model whether the candidate genuinely
+    CONTRADICTS the existing note. Returns (confirmed, tokens_used).
+
+    Fail-safe: any error, parse failure, or a non-CONTRADICTS verdict returns
+    False. A failed or ambiguous confirmation must NEVER green-light a destructive
+    supersede — the cost of a wrong destroy is higher than a redundant quarantine.
+    """
+    try:
+        verdicts, tok = _classify_candidate_vs_neighbours(
+            llm=confirm_llm, candidate_text=candidate_text, neighbours=[(existing, 0.0)]
+        )
+    except Exception:  # network / parse / provider error — do not destroy
+        return False, 0
+    v = next((x for x in verdicts if x.existing_id == existing.id), None)
+    return (v is not None and v.verdict == "CONTRADICTS"), tok
+
+
+def _parse_coverage(text: str) -> bool:
+    """Parse {"fully_superseded": bool}. Raises ValueError on no/invalid JSON so the
+    retry wrapper fires; returns the bool on success."""
+    parsed = _safe_parse_json(text, default=_MISSING)
+    if parsed is _MISSING or not isinstance(parsed, dict):
+        raise ValueError(f"No valid JSON object in response: {text[:120]!r}")
+    return _CoverageResult.model_validate(parsed).fully_superseded
+
+
+def _new_supersedes_cleanly(
+    *, llm: Llm, new_text: str, old_text: str
+) -> Tuple[bool, int]:
+    """ADR-0014 §3 partial-information guard. Returns (safe_to_destroy_old, tokens).
+
+    True only if the model judges the NEW fact preserves every still-valid fact in
+    the OLD fact, so superseding loses nothing. Fail-safe: any error or validation
+    failure resolves to False (do NOT destroy — quarantine instead), consistent
+    with §2: when unsure, never destroy.
+    """
+    try:
+        result, tokens = _llm_call_with_retry(
+            llm=llm,
+            system=SUPERSEDE_COVERAGE_SYSTEM,
+            user_msg=json.dumps({"old": old_text, "new": new_text}, ensure_ascii=False),
+            parse_fn=_parse_coverage,
+            max_tokens=200,
+            default=False,
+        )
+    except Exception:  # network / provider error — do not destroy
+        return False, 0
+    return bool(result), tokens
+
+
+def _note_conviction(note: Note, *, now_dt, recency_half_life_days: float) -> float:
+    """ADR-0014 §5 conviction score for a quarantined note — higher = stronger
+    standing. Combines independent corroboration (distinct source episodes),
+    recall reinforcement (access_count), durability (promoted to profile), and a
+    recency term in [0, 1]. Pure function so it is unit-testable."""
+    corroboration = float(len(note.source_episode_ids))
+    reinforcement = float(note.access_count)
+    promoted = 2.0 if note.promoted_to_profile else 0.0
+    ref = note.last_accessed_at or note.ingested_at or note.valid_from
+    recency = 0.0
+    if ref:
+        try:
+            age_days = max(0.0, (now_dt - iso_to_dt(ref)).total_seconds() / 86400.0)
+            recency = math.exp(-age_days / max(1.0, recency_half_life_days))
+        except Exception:
+            recency = 0.0
+    return corroboration + reinforcement + promoted + recency
+
+
+def _phase4b_resolve_contradictions(
+    *,
+    store: "MemoryStore",
+    judge: Llm,
+    config: DreamConfig,
+    now: str,
+    journal: List[str],
+) -> Tuple[int, int]:
+    """ADR-0014 §5: resolve quarantined contradictions whose conviction has
+    decisively separated. Returns (resolved_count, tokens_used).
+
+    For each still-valid note linked via `contradicts` to a still-valid note:
+      1. re-confirm it is a genuine contradiction (filters out false-contradictions
+         that were quarantined — e.g. different-scope pairs — which must never be
+         "resolved" by destroying a side);
+      2. require the conviction gap between the two to exceed the configured
+         minimum (evidence has actually accumulated for one side);
+      3. require the higher-conviction side to fully cover the loser (§3 guard);
+    then supersede the loser. Anything short of all three stays quarantined.
+    """
+    tokens = 0
+    resolved = 0
+    now_dt = iso_to_dt(now)
+    half_life = float(config.decay_half_life_days)
+    min_gap = config.contradiction_resolution_min_gap
+    invalidated_ids: set = set()
+
+    for note in store.list_valid_notes():
+        if note.id in invalidated_ids or not note.contradicts:
+            continue
+        for old_id in list(note.contradicts):
+            if old_id in invalidated_ids:
+                continue
+            old = store.get_note(old_id)
+            if old is None or old.valid_to is not None:
+                continue  # already resolved / gone
+
+            genuine, t1 = _confirm_contradiction(
+                confirm_llm=judge, candidate_text=note.text, existing=old
+            )
+            tokens += t1
+            if not genuine:
+                continue  # false-contradiction or no longer conflicting — keep both
+
+            cn = _note_conviction(note, now_dt=now_dt, recency_half_life_days=half_life)
+            co = _note_conviction(old, now_dt=now_dt, recency_half_life_days=half_life)
+            if abs(cn - co) < min_gap:
+                continue  # evidence has not separated them yet
+
+            winner, loser = (note, old) if cn >= co else (old, note)
+            clean, t2 = _new_supersedes_cleanly(
+                llm=judge, new_text=winner.text, old_text=loser.text
+            )
+            tokens += t2
+            if not clean:
+                continue  # would lose still-true info — keep both
+
+            store.invalidate_note(loser.id, when=now, superseded_by=winner.id)
+            store.bump_note_access(winner.id, now)
+            invalidated_ids.add(loser.id)
+            resolved += 1
+            journal.append(
+                f"Phase 4b: resolved quarantined contradiction — superseded "
+                f"{loser.id} (conviction {min(cn, co):.2f}) with {winner.id} "
+                f"(conviction {max(cn, co):.2f}); gap {abs(cn - co):.2f} >= "
+                f"{min_gap} (ADR-0014 §5)"
+            )
+            if loser.id == note.id:
+                break  # the link holder was superseded — stop scanning its links
+
+    journal.append(f"Phase 4b: resolved {resolved} quarantined contradiction(s).")
+    return resolved, tokens
 
 
 def _classify_candidate_vs_neighbours(

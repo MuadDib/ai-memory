@@ -119,19 +119,116 @@ is exactly what proposal §12 warns against).
 
 ### Deferred to post-backfill (need real distance data)
 
-- [ ] **Tune Phase 4 dedup**: `DUPLICATE_DIST_BELOW` is currently 0.10 — and was
-      *deliberately* lowered from 0.20 so value-changes (port 8080→9000) reach the
-      LLM as CONTRADICTS. Raising it to ~0.35 to collapse the "tea ×18" near-dups
-      trades off against contradiction detection, so it **must** be eval-driven on
-      the drained corpus, not blind.
+- [x] **Recall score normalisation** (also P2 — done 2026-06-07 evening):
+      episode hits were scored via `1/(1+distance)` (~0.4–0.9) while notes scored
+      via `RRF*recency` (~0.01–0.03) — a ~30x scale gap that let weakly-related
+      episodes mathematically bury well-corroborated notes once the drained
+      backfill tripled the note corpus (eval recall@k 96.3% → 70.4%, 26/27 → 19/27).
+      Fix: folded episodes into the *same* `reciprocal_rank_fusion` as a third
+      ranker (`recall.py`), so an item's TYPE never decides the outcome — only its
+      RANK across the signals that found it does. Regression test added
+      (`test_recall_merge.py::test_doubly_corroborated_note_outranks_weakly_matched_episode`,
+      proven to fail against the old scoring and pass against the new).
+- [x] **BM25 was silently dead on every natural-language query** (found while
+      re-baselining the above — not in the original list, but the same
+      "recall ranking quality" bucket). `_fts5_escape` joined every token with
+      FTS5's implicit AND, so a query like "what operating system and shell
+      environment does Igor use" required notes to contain literally every word
+      including "what"/"does"/"use" — zero notes ever matched, leaving vector
+      search as the *only* ranker (`bm25_candidates=0` on nearly every recall).
+      Fix: join with `OR` instead — true bag-of-words, relying on `bm25()`'s
+      IDF weighting to rank rare-term hits ("Murphy", "gpt-4o-mini") above
+      filler-word-only hits. Regression test added
+      (`test_storage_sqlite.py::test_bm25_search_natural_language_query_matches_on_shared_terms`).
+      Also added `PRAGMA busy_timeout = 5000` to `SqliteStore.initialise()` —
+      concurrent CLI + `serve` access was throwing "database is locked"
+      immediately with no retry window.
+  > **Eval recovery, measured 2026-06-07 evening** (`AI_MEMORY_HOME` pointed at
+  > the live, fully-drained corpus): post-backfill regressed baseline **19/27
+  > (70.4%)** → **21/27 (77.8%)** after both fixes — a real recovery, though still
+  > short of the pre-backfill **26/27 (96.3%)**. Case-level diff: net +2 (gained
+  > `llm-provider`, `murphy-bed`, `primary-language`, `profile-company` lost
+  > nothing from the BM25 fix; the RRF-unification step alone was actually net
+  > -2 in isolation — see "Remaining gap" below for why that's not a red flag).
+  >
+  > **Remaining gap is corpus density, not scoring** — confirmed by direct
+  > inspection: the correct note for every still-failing case (e.g. "Igor works
+  > as a Senior Software Developer, Team Lead, Architect at Citywire", "Igor's
+  > working environment includes Windows with WSL Ubuntu") IS retrieved and
+  > ranks just *below* the eval's k cutoff (rank 9–13 vs k=5/8), buried under a
+  > pile of near-duplicate notes about the same general topic ("Igor lives and
+  > works in London", "Igor is a programmer who leads a team…", "Igor uses a
+  > Windows environment for development"). This is precisely what the next item
+  > below is for.
+- [x] **Tune Phase 4 dedup + retroactive consolidation — DONE 2026-06-08.**
+      Two parts: (a) retuned the live thresholds; (b) built and ran a retroactive
+      pass over the already-stored corpus (the freeze had let near-dups pile up
+      faster than the live path could ever catch them, since live dedup only sees
+      a note vs *prior* notes at ingestion).
+
+      **What landed:**
+      - `scripts/consolidate_duplicate_notes.py` — walks valid notes oldest-first,
+        re-runs the Phase 4 verdict on each near-neighbour pair, merges DUPLICATEs
+        and resolves CONTRADICTS. Dry-run by default; `--apply` to write; `--limit`,
+        `--use-mini`, `--pace-seconds`, `--no-second-opinion` knobs. Soft-delete
+        only (reversible via `valid_to`). 15 tests.
+      - **Preference-protection gate** (`dreaming._blocks_preference_override`,
+        wired into BOTH the retro script AND live `_phase4_integrate`): a structural,
+        zero-LLM rule — a non-`preference` candidate may never DUPLICATE/CONTRADICTS
+        a `preference`-tagged note. Found via a 2026-06-07 measurement: episodic
+        notes (`problem`/`workflow`/`fix`) were *systematically* (4/4) judged to
+        override standing preferences, and the bias **survived an adversarial
+        same-model second opinion** — only structural/tag signal or *model
+        diversity* catches a systematic bias. Gate fired 18× on the live run, 0
+        false blocks.
+      - **Provenance parity**: retro CONTRADICTS now records the `contradicts` link
+        on the surviving note, matching the live Phase 4 path.
+      - Two real bugs fixed en route: a `StopIteration` on hallucinated `existing_id`
+        (now logged + skipped, regression-tested in both paths); a `UnicodeEncodeError`
+        from cp1252 stdout on Unicode note text (stdout reconfigured to UTF-8).
+
+      **Live-corpus result (2026-06-08):** dry-run on 1980 valid notes (gpt-4o-mini
+      judge, adversarial double-check) flagged 230 actions. Applied the **182
+      DUPLICATEs** directly from the report (deterministic; no re-walk). The **48
+      CONTRADICTS** were re-judged via a **cross-model vote (gpt-4o + Claude
+      sonnet-4-6)** — only pairs *both* models confirmed survived: **32 killed as
+      false positives (67%)**, 9 model-split (held), **7 confirmed and applied**.
+      Corpus **1980 → 1791 valid notes (−189)**. Two timestamped DB backups taken;
+      all changes reversible.
+
+      **Key finding for the live path:** cross-model agreement is *necessary but
+      not sufficient* — among the 7 confirmed, ≥1 was a shared-blind-spot false
+      positive (two different dream-pass token counts read as a contradiction) and
+      others were *temporal evolution* (count grew 116→124) or *partial-information
+      loss* (superseding a stale timeout also destroyed a still-true WAL-mode fact).
+      Voting cannot fix these; they need conviction/recency context and
+      non-destructive resolution. → see the live-path design below.
+      - [x] *(follow-up, 2026-06-08)* Re-baselined `ai-memory eval` on the deduped
+        1791-note corpus: **20/27 (74.1%)** — essentially flat vs the pre-dedup
+        **77.8% (21/27)**, i.e. **dedup did NOT deliver the hypothesised recall
+        recovery; if anything it cost one case.** The hypothesis ("near-dup clusters
+        bury the specific Citywire/WSL/backend facts") was wrong: those cases still
+        fail after the clusters were collapsed. Two effects roughly cancel —
+        removing redundant notes is good hygiene (−189 notes, less noise fed to the
+        agent), but collapsing the corroborating near-dups also *reduces the RRF
+        mass* behind the general fact, so the buried specific note doesn't rise. The
+        residual gap is a **retrieval-ranking** problem (the correct note embeds far
+        from the natural-language query and ranks just below k) — addressable by the
+        cross-encoder rerank / grounding items, **not** by dedup. Net: dedup was the
+        right call for corpus hygiene and contradiction cleanup, but it is not a
+        recall lever.
 - [ ] **Extraction grounding gate**: embed each extracted fact, drop those far from
       their source chunk (keeps British-Gas-promo / "AWS Durable Functions"
       hallucinations out of Tier 1). Threshold must be read off the real
       good-vs-junk distance distribution — same data-driven approach as the recall
       floor tuning.
-- [ ] **Revisit Phase 4 contradiction detection** with live data.
-- [ ] **Recall score normalisation** (also P2): episode hits (~0.5) bury note hits
-      (~0.01) regardless of relevance.
+- [ ] **Revisit Phase 4 contradiction detection** with live data — **now
+      designed**, see [ADR-0014 — Conviction-Gated, Non-Destructive Contradiction
+      Resolution](../decisions/0014-conviction-gated-contradiction-resolution.md).
+      The 2026-06-08 retro pass surfaced the concrete failure modes (systematic
+      over-flagging; temporal-evolution-vs-contradiction; partial-information loss
+      on supersede) that the ADR's quarantine + cross-model + conviction design
+      addresses for the *unattended* live path.
 
 ---
 
@@ -139,8 +236,6 @@ is exactly what proposal §12 warns against).
 
 - [ ] **Local embedder** (sentence-transformers via ONNX) to kill the 2.8 s
       recall latency (currently 14× over the <200 ms goal; remote embed dominates).
-- [ ] **Recall score normalisation**: episode hits (~0.5) bury note hits (~0.01);
-      put them on a comparable scale before the merge-sort.
 - [ ] **Separate provenance from semantic tags**: stop `cowork`/`claude-chat`/
       `bootstrap`/`e2e-test` leaking into the semantic tag space.
 - [ ] **Grow live cross-client capture**: 912/985 episodes are the one-time

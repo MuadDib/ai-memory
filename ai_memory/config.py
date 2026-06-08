@@ -47,6 +47,18 @@ class LlmConfig:
     # use `model`.  Example: "gpt-4o" when base is "gpt-4o-mini".
     quality_model: str = ""
 
+    # Cross-model confirmation for destructive contradictions (ADR-0014 §2).
+    # When set, a Phase 4 CONTRADICTS verdict only SUPERSEDES the existing note
+    # if this second, ideally different-family model ALSO returns CONTRADICTS;
+    # otherwise the pair is quarantined (both kept, linked). Leave empty to
+    # quarantine ALL contradictions (the safe default — no unattended destroy).
+    # `confirm_provider` lets the confirmer come from a different family than
+    # `provider` (model diversity is what catches a systematic single-model bias).
+    # Example: provider=openai/model=gpt-4o-mini with confirm_provider=anthropic/
+    # contradiction_confirm_model=claude-sonnet-4-6.
+    contradiction_confirm_model: str = ""
+    confirm_provider: Literal["anthropic", "openai"] = "anthropic"
+
 
 @dataclass(frozen=True)
 class DreamConfig:
@@ -73,6 +85,16 @@ class DreamConfig:
     # rate-limit before giving up, and the base seconds for exponential backoff.
     rate_limit_max_retries: int = 5
     rate_limit_backoff_seconds: float = 2.0
+
+    # ADR-0014 §5 conviction-gated resolution of quarantined contradictions.
+    # When enabled, a periodic pass re-confirms each quarantined contradiction is
+    # genuine, then supersedes the lower-conviction side IF the conviction gap
+    # exceeds `contradiction_resolution_min_gap` AND the winner fully covers the
+    # loser (§3). Off by default — quarantined pairs simply persist (both kept,
+    # linked) until enabled. Conviction = distinct source episodes + access_count
+    # + a promoted bonus + a recency term.
+    resolve_contradictions: bool = False
+    contradiction_resolution_min_gap: float = 3.0
 
 
 @dataclass(frozen=True)

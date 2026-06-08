@@ -49,6 +49,7 @@ class MemoryService:
     embedder: Embedder
     llm: Llm
     quality_llm: "Llm | None" = None
+    confirm_llm: "Llm | None" = None
 
     # --- Lifecycle -------------------------------------------------------
 
@@ -93,11 +94,34 @@ class MemoryService:
                 from ai_memory.llm.openai_llm import OpenAILlm
                 quality_llm = OpenAILlm(model=config.llm.quality_model, **retry_kwargs)
 
+        # Optional cross-model contradiction confirmer (ADR-0014 §2). Built only
+        # when configured AND its provider key is available — a missing key must
+        # NOT crash the service; it degrades to "quarantine all contradictions"
+        # (the safe default, since confirm_llm=None means no destructive supersede).
+        confirm_llm: Llm | None = None
+        if config.llm.contradiction_confirm_model:
+            try:
+                if config.llm.confirm_provider == "anthropic":
+                    confirm_llm = AnthropicLlm(
+                        model=config.llm.contradiction_confirm_model, **retry_kwargs
+                    )
+                elif config.llm.confirm_provider == "openai":
+                    from ai_memory.llm.openai_llm import OpenAILlm
+                    confirm_llm = OpenAILlm(
+                        model=config.llm.contradiction_confirm_model, **retry_kwargs
+                    )
+            except Exception as exc:  # missing key / bad config — degrade safely
+                logger.warning(
+                    "Cross-model contradiction confirmer disabled (%s); "
+                    "contradictions will be quarantined, not superseded.", exc
+                )
+                confirm_llm = None
+
         store = SqliteStore(config.database_path, embedding_dim=embedder.dimensions)
         raw = RawTranscriptStore(config.raw_dir)
         return cls(
             config=config, store=store, raw=raw, embedder=embedder,
-            llm=llm, quality_llm=quality_llm,
+            llm=llm, quality_llm=quality_llm, confirm_llm=confirm_llm,
         )
 
     def start(self) -> None:
@@ -186,6 +210,7 @@ class MemoryService:
                 embedder=self.embedder,
                 llm=self.llm,
                 quality_llm=self.quality_llm,
+                confirm_llm=self.confirm_llm,
                 config=self.config.dream,
                 request=_dreaming.DreamRequest(
                     trigger=trigger, since=since, max_episodes=max_episodes
