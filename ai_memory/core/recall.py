@@ -128,6 +128,37 @@ def _llm_rerank(
         return hits
 
 
+HYDE_SYSTEM = (
+    "You help a memory search engine. Given a QUESTION, write ONE short, plausible "
+    "declarative sentence that would directly ANSWER it — phrased as a stored fact, "
+    "not a question. Invent reasonable specifics if needed; this text is only used "
+    "to steer vector search toward the answer's phrasing and is never shown to "
+    "anyone. Output the single sentence only, no preamble."
+)
+
+
+def _hyde_embedding(
+    *, llm: "Llm", embedder: Embedder, query: str
+) -> list[float] | None:
+    """HyDE (#2): embed a hypothetical ANSWER to the query rather than the question,
+    bridging the interrogative-query / declarative-fact gap. Returns the embedding,
+    or None on any failure so the caller falls back to the plain query embedding."""
+    try:
+        completion = llm.complete(
+            system=HYDE_SYSTEM,
+            messages=[Message(role="user", content=query)],
+            max_tokens=80,
+        )
+        hypo = (completion.text or "").strip()
+        if not hypo:
+            return None
+        [emb] = embedder.embed([hypo])
+        return emb
+    except Exception:
+        logger.warning("HyDE failed; falling back to plain query embedding", exc_info=False)
+        return None
+
+
 def recall(
     *,
     store: "MemoryStore",
@@ -147,8 +178,14 @@ def recall(
     #    but that caused deadlocks when multiple recall threads accessed the shared
     #    sqlite3 connection concurrently (sqlite3 connections are not thread-safe).
     #    The ~5 ms BM25 saving is not worth the complexity; keep it sequential.
+    #    With HyDE (#2, off by default) we vector-search on a hypothetical ANSWER's
+    #    embedding instead of the question's; BM25 below still uses the raw query.
     _t_embed = time.monotonic()
-    [query_embedding] = embedder.embed([request.query])
+    query_embedding = None
+    if config.hyde_enabled and llm is not None:
+        query_embedding = _hyde_embedding(llm=llm, embedder=embedder, query=request.query)
+    if query_embedding is None:
+        [query_embedding] = embedder.embed([request.query])
     _embed_ms = (time.monotonic() - _t_embed) * 1000
 
     # 2. BM25 (sequential, safe — single thread per recall invocation).

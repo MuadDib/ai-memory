@@ -4,7 +4,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from ai_memory.core.models import RecallHit
-from ai_memory.core.recall import _llm_rerank, reciprocal_rank_fusion
+from ai_memory.core.recall import _hyde_embedding, _llm_rerank, reciprocal_rank_fusion
 from ai_memory.llm.interface import CompletionResult
 
 
@@ -64,6 +64,34 @@ def test_rerank_noop_for_single_candidate() -> None:
     out = _llm_rerank(llm=llm, query="q", hits=hits, top_n=5)
     assert out == hits
     llm.complete.assert_not_called()
+
+
+# --- #2 HyDE ----------------------------------------------------------------
+
+
+def test_hyde_embeds_the_hypothetical_answer_not_the_question() -> None:
+    llm = _rerank_llm("Igor works at Citywire as a team lead.")
+    emb = MagicMock()
+    emb.embed.return_value = [[0.5, 0.5]]
+    out = _hyde_embedding(llm=llm, embedder=emb, query="where does Igor work")
+    assert out == [0.5, 0.5]
+    emb.embed.assert_called_once_with(["Igor works at Citywire as a team lead."])
+
+
+def test_hyde_failsafe_returns_none_on_provider_error() -> None:
+    llm = MagicMock()
+    llm.complete.side_effect = RuntimeError("provider down")
+    emb = MagicMock()
+    out = _hyde_embedding(llm=llm, embedder=emb, query="q")
+    assert out is None
+    emb.embed.assert_not_called()  # never reached the embedder
+
+
+def test_hyde_empty_answer_returns_none() -> None:
+    llm = _rerank_llm("   ")
+    emb = MagicMock()
+    out = _hyde_embedding(llm=llm, embedder=emb, query="q")
+    assert out is None
 
 
 def test_rrf_single_ranker() -> None:

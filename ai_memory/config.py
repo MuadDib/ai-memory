@@ -134,6 +134,15 @@ class RecallConfig:
     rerank_enabled: bool = False
     rerank_candidates: int = 20
 
+    # Recall-quality follow-up #2 — optional HyDE (Hypothetical Document
+    # Embeddings). An interrogative query ("what company does Igor work for")
+    # embeds far from the terse declarative fact that answers it ("Role: ... at
+    # Citywire"). When enabled, the LLM writes a short hypothetical ANSWER and we
+    # vector-search on THAT embedding instead of the question's. BM25 still uses
+    # the raw query text. OFF by default (same hot-path reasoning as rerank);
+    # fail-safe to the plain query embedding on any error.
+    hyde_enabled: bool = False
+
 
 @dataclass(frozen=True)
 class Config:
