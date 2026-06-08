@@ -4,7 +4,12 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from ai_memory.core.models import RecallHit
-from ai_memory.core.recall import _hyde_embedding, _llm_rerank, reciprocal_rank_fusion
+from ai_memory.core.recall import (
+    _conviction_boost,
+    _hyde_embedding,
+    _llm_rerank,
+    reciprocal_rank_fusion,
+)
 from ai_memory.llm.interface import CompletionResult
 
 
@@ -92,6 +97,27 @@ def test_hyde_empty_answer_returns_none() -> None:
     emb = MagicMock()
     out = _hyde_embedding(llm=llm, embedder=emb, query="q")
     assert out is None
+
+
+# --- #3 conviction boost ----------------------------------------------------
+
+
+def test_conviction_weight_zero_is_identity() -> None:
+    assert _conviction_boost(access_count=9, source_episodes=9, weight=0.0) == 1.0
+
+
+def test_conviction_boost_rewards_corroboration_and_access() -> None:
+    none = _conviction_boost(access_count=0, source_episodes=0, weight=0.2)
+    some = _conviction_boost(access_count=2, source_episodes=3, weight=0.2)
+    more = _conviction_boost(access_count=10, source_episodes=8, weight=0.2)
+    assert none == 1.0            # log1p(0) = 0 -> no boost for an uncorroborated note
+    assert more > some > none     # monotonic in the combined signal
+
+
+def test_conviction_boost_is_gentle_log_scaled() -> None:
+    # A heavily-corroborated note gets a bounded nudge, not a runaway multiplier.
+    big = _conviction_boost(access_count=100, source_episodes=100, weight=0.2)
+    assert 1.0 < big < 2.2
 
 
 def test_rrf_single_ranker() -> None:

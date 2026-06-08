@@ -143,6 +143,13 @@ class RecallConfig:
     # fail-safe to the plain query embedding on any error.
     hyde_enabled: bool = False
 
+    # Recall-quality follow-up #3 — conviction-aware ranking. Beyond recency, give
+    # a gentle multiplicative boost to notes corroborated by multiple source
+    # episodes and reinforced by past recall (access_count), so a well-established
+    # canonical fact outranks a one-off near-duplicate. Always on; set to 0 to
+    # disable. Applied to notes only (episodes have no such signal).
+    conviction_weight: float = 0.2
+
 
 @dataclass(frozen=True)
 class Config:

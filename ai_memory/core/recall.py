@@ -159,6 +159,17 @@ def _hyde_embedding(
         return None
 
 
+def _conviction_boost(*, access_count: int, source_episodes: int, weight: float) -> float:
+    """Recall ranking boost (#3): reward facts corroborated by multiple source
+    episodes and reinforced by past recall. A gentle multiplicative nudge >= 1.0
+    (log-scaled so a handful of corroborations helps without one popular note
+    dominating). weight=0 disables it (returns 1.0)."""
+    if weight <= 0:
+        return 1.0
+    signal = max(0, access_count) + max(0, source_episodes)
+    return 1.0 + weight * math.log1p(signal)
+
+
 def recall(
     *,
     store: "MemoryStore",
@@ -287,14 +298,23 @@ def recall(
     boosted: list[tuple[str, float]] = []
     for item_id, base_score in fused.items():
         if item_id in notes_by_id:
-            anchor = notes_by_id[item_id].ingested_at
+            note = notes_by_id[item_id]
+            anchor = note.ingested_at
+            # #3 conviction boost: corroboration (source episodes) + reinforcement
+            # (access_count). Notes only; episodes have no comparable signal.
+            conviction = _conviction_boost(
+                access_count=note.access_count,
+                source_episodes=len(note.source_episode_ids),
+                weight=config.conviction_weight,
+            )
         elif item_id in episodes_by_id:
             anchor = episodes_by_id[item_id].started_at
+            conviction = 1.0
         else:
             continue
         age = max(0, (iso_to_dt(now) - iso_to_dt(anchor)).total_seconds())
         boost = math.exp(-age / half_life_seconds)
-        boosted.append((item_id, base_score * boost))
+        boosted.append((item_id, base_score * boost * conviction))
     boosted.sort(key=lambda pair: pair[1], reverse=True)
 
     # 7. Take a candidate pool. When rerank is enabled we keep a WIDER pool
