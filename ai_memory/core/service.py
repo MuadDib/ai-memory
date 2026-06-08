@@ -161,6 +161,7 @@ class MemoryService:
             embedder=self.embedder,
             config=self.config.recall,
             request=request,
+            llm=self.llm,
         )
 
     def dream(

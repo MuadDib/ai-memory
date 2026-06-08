@@ -29,6 +29,7 @@ so the ranker-internal scores remain comparable.
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
@@ -38,10 +39,12 @@ from typing import TYPE_CHECKING
 from ai_memory.config import RecallConfig
 from ai_memory.core.models import RecallHit
 from ai_memory.embeddings.interface import Embedder
+from ai_memory.llm.interface import Message
 from ai_memory.storage.raw_files import RawTranscriptStore
 from ai_memory.timestamps import iso_to_dt, now_iso
 
 if TYPE_CHECKING:
+    from ai_memory.llm.interface import Llm
     from ai_memory.storage.interface import MemoryStore
 
 
@@ -75,6 +78,56 @@ def reciprocal_rank_fusion(
     return scores
 
 
+RERANK_SYSTEM = (
+    "You are a search reranker (a cross-encoder). Given a QUERY and a numbered "
+    "list of candidate memory facts, return the candidate indices ordered from "
+    "MOST to LEAST relevant for ANSWERING the query. Judge whether each candidate "
+    "actually answers or directly informs the query — not mere topical overlap. "
+    "A specific, direct answer outranks a general or tangential mention. Include "
+    "every index exactly once.\n"
+    'Output JSON only: {"order": [<index>, <index>, ...]}.'
+)
+
+
+def _llm_rerank(
+    *, llm: "Llm", query: str, hits: list[RecallHit], top_n: int
+) -> list[RecallHit]:
+    """LLM cross-encoder rerank of the top `top_n` hits (the rest are left in place
+    after them). Returns a reordered hits list. Fail-safe: returns the input
+    UNCHANGED on any error or invalid output — reranking must never drop a hit."""
+    pool = hits[:top_n]
+    if len(pool) < 2:
+        return hits
+    payload = {
+        "query": query,
+        "candidates": [{"i": i, "text": h.text[:400]} for i, h in enumerate(pool)],
+    }
+    try:
+        completion = llm.complete(
+            system=RERANK_SYSTEM,
+            messages=[Message(role="user", content=json.dumps(payload, ensure_ascii=False))],
+            max_tokens=256,
+        )
+        text = completion.text
+        s, e = text.find("{"), text.rfind("}")
+        order = json.loads(text[s:e + 1]).get("order") if s != -1 and e != -1 else None
+        if not isinstance(order, list):
+            return hits
+        reordered: list[RecallHit] = []
+        seen: set[int] = set()
+        for idx in order:
+            if isinstance(idx, int) and 0 <= idx < len(pool) and idx not in seen:
+                reordered.append(pool[idx])
+                seen.add(idx)
+        for i, h in enumerate(pool):  # append any indices the model omitted
+            if i not in seen:
+                reordered.append(h)
+        return reordered + hits[top_n:]
+    except Exception:  # malformed JSON / provider error — keep the fused order
+        logger.warning("rerank failed; falling back to fused order", exc_info=False)
+        return hits
+
+
 def recall(
     *,
     store: "MemoryStore",
@@ -82,6 +135,7 @@ def recall(
     embedder: Embedder,
     config: RecallConfig,
     request: RecallRequest,
+    llm: "Llm | None" = None,
     now: str | None = None,
 ) -> list[RecallHit]:
     """Run the recall pipeline. Returns a ranked list of hits."""
@@ -206,8 +260,12 @@ def recall(
         boosted.append((item_id, base_score * boost))
     boosted.sort(key=lambda pair: pair[1], reverse=True)
 
-    # 7. Take top k — notes and episodes interleaved by their true fused rank.
-    top_k = boosted[: request.k]
+    # 7. Take a candidate pool. When rerank is enabled we keep a WIDER pool
+    #    (`rerank_candidates`) so the LLM cross-encoder can pull a just-below-k
+    #    answer up into the top k; otherwise the pool is exactly k.
+    rerank_on = config.rerank_enabled and llm is not None
+    pool_n = max(request.k, config.rerank_candidates) if rerank_on else request.k
+    top_k = boosted[:pool_n]
     note_hits: list[RecallHit] = []
     for item_id, score in top_k:
         if item_id in notes_by_id:
@@ -237,9 +295,17 @@ def recall(
                 )
             )
 
-    # Final relevance gate: drop anything below the absolute score floor.
+    # Final relevance gate: drop anything below the absolute score floor (applied
+    # on the fused*recency score, before any rerank reorders the survivors).
     if config.final_score_floor > 0:
         note_hits = [h for h in note_hits if h.score >= config.final_score_floor]
+
+    # 7b. Cross-encoder rerank the wider pool, then cut to k (#1, off by default).
+    if rerank_on:
+        note_hits = _llm_rerank(
+            llm=llm, query=request.query, hits=note_hits, top_n=pool_n
+        )
+    note_hits = note_hits[: request.k]
 
     # 8. For "verbatim" — pull the underlying turns for the top episodes.
     if request.depth == "verbatim":

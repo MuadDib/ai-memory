@@ -123,6 +123,17 @@ class RecallConfig:
     vector_distance_floor: float = 1.1
     final_score_floor: float = 0.0  # post-RRF/recency cutoff (0 = keep everything fused)
 
+    # Recall-quality follow-up #1 — optional LLM cross-encoder rerank. The fused
+    # RRF ranking retrieves the right note but often lands it just below k (a
+    # natural-language question embeds far from the terse fact that answers it).
+    # When enabled, the top `rerank_candidates` fused hits are re-scored by an LLM
+    # jointly reading (query, candidate) and re-sorted before the top-k cut.
+    # OFF by default: keeps the recall hot path LLM-free per the architecture
+    # ("heavy LLM work happens in dream cycles, never on the recall hot path").
+    # Turn on when top-k precision matters more than the added latency/cost.
+    rerank_enabled: bool = False
+    rerank_candidates: int = 20
+
 
 @dataclass(frozen=True)
 class Config:

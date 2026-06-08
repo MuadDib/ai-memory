@@ -1,7 +1,69 @@
 """Pure-function tests for the recall pipeline (no DB required)."""
 from __future__ import annotations
 
-from ai_memory.core.recall import reciprocal_rank_fusion
+from unittest.mock import MagicMock
+
+from ai_memory.core.models import RecallHit
+from ai_memory.core.recall import _llm_rerank, reciprocal_rank_fusion
+from ai_memory.llm.interface import CompletionResult
+
+
+def _hit(id_: str, text: str, score: float = 0.01) -> RecallHit:
+    return RecallHit(item_type="note", id=id_, text=text, score=score)
+
+
+def _rerank_llm(order_json: str) -> MagicMock:
+    llm = MagicMock()
+    llm.model_id = "mock"
+    llm.complete.return_value = CompletionResult(
+        text=order_json, input_tokens=1, output_tokens=1,
+        model_id="mock", finish_reason="stop",
+    )
+    return llm
+
+
+def test_rerank_reorders_pool_by_llm_order() -> None:
+    hits = [_hit("a", "A"), _hit("b", "B"), _hit("c", "C")]
+    llm = _rerank_llm('{"order": [2, 0, 1]}')
+    out = _llm_rerank(llm=llm, query="q", hits=hits, top_n=3)
+    assert [h.id for h in out] == ["c", "a", "b"]
+
+
+def test_rerank_appends_omitted_indices_in_original_order() -> None:
+    hits = [_hit("a", "A"), _hit("b", "B"), _hit("c", "C")]
+    llm = _rerank_llm('{"order": [2]}')  # model only ranked one
+    out = _llm_rerank(llm=llm, query="q", hits=hits, top_n=3)
+    assert [h.id for h in out] == ["c", "a", "b"]  # c first, then a,b untouched
+
+
+def test_rerank_keeps_tail_beyond_top_n_in_place() -> None:
+    hits = [_hit("a", "A"), _hit("b", "B"), _hit("c", "C"), _hit("d", "D")]
+    llm = _rerank_llm('{"order": [1, 0]}')
+    out = _llm_rerank(llm=llm, query="q", hits=hits, top_n=2)
+    assert [h.id for h in out] == ["b", "a", "c", "d"]  # tail c,d untouched
+
+
+def test_rerank_failsafe_returns_input_on_bad_output() -> None:
+    hits = [_hit("a", "A"), _hit("b", "B")]
+    llm = _rerank_llm("not json at all")
+    out = _llm_rerank(llm=llm, query="q", hits=hits, top_n=2)
+    assert [h.id for h in out] == ["a", "b"]  # unchanged — never drops hits
+
+
+def test_rerank_failsafe_on_provider_error() -> None:
+    hits = [_hit("a", "A"), _hit("b", "B")]
+    llm = MagicMock()
+    llm.complete.side_effect = RuntimeError("provider down")
+    out = _llm_rerank(llm=llm, query="q", hits=hits, top_n=2)
+    assert [h.id for h in out] == ["a", "b"]
+
+
+def test_rerank_noop_for_single_candidate() -> None:
+    hits = [_hit("a", "A")]
+    llm = _rerank_llm('{"order": [0]}')
+    out = _llm_rerank(llm=llm, query="q", hits=hits, top_n=5)
+    assert out == hits
+    llm.complete.assert_not_called()
 
 
 def test_rrf_single_ranker() -> None:
