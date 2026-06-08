@@ -1,6 +1,6 @@
 """
-Recall pipeline: hybrid search (BM25 + vector) fused with Reciprocal Rank Fusion,
-soft-boosted by recency.
+Recall pipeline: hybrid search (BM25 + vector, over both notes AND episodes)
+fused with Reciprocal Rank Fusion, soft-boosted by recency.
 
 Three depths:
     - "fast"     -> profile + top-k notes
@@ -11,6 +11,14 @@ RRF formula:
     score(doc) = sum over rankers of  1 / (k_rrf + rank_in_ranker(doc))
 
 We use k_rrf = 60 (the value Supermemory found generalises well).
+
+Notes and episodes are fused through this SAME formula, as parallel rankers
+(note-vector, note-BM25, episode-vector), so an item's TYPE never decides the
+final ranking by scale artifact — only its RANK across the signals that found
+it does. (An earlier version scored episodes via 1/(1+distance), landing on a
+~30x larger scale than notes' RRF*recency scores; that let weakly-related
+episodes mathematically bury well-corroborated notes once the corpus grew —
+see the regression test in test_recall_merge.py for the concrete scenario.)
 
 Recency boost:
     boost(doc) = exp(- age_days / half_life_days)
@@ -134,54 +142,16 @@ def recall(
         if dist <= config.vector_distance_floor
     ]
 
-    # 3. RRF fuse.
-    vector_ids = [n.id for n, _ in vector_hits]
-    bm25_ids = [n.id for n, _ in bm25_hits]
-    fused = reciprocal_rank_fusion([vector_ids, bm25_ids], k_rrf=config.rrf_k)
-
-    # 4. Resolve back to Note objects (one of the rankers will have it).
-    notes_by_id = {n.id: n for n, _ in vector_hits}
-    notes_by_id.update({n.id: n for n, _ in bm25_hits})
-
-    # 5. Apply recency boost.
-    half_life_seconds = max(1, config.recency_half_life_days * 86400)
-    boosted: list[tuple[str, float]] = []
-    for note_id, base_score in fused.items():
-        note = notes_by_id.get(note_id)
-        if note is None:
-            continue
-        age = max(0, (iso_to_dt(now) - iso_to_dt(note.ingested_at)).total_seconds())
-        boost = math.exp(-age / half_life_seconds)
-        boosted.append((note_id, base_score * boost))
-    boosted.sort(key=lambda pair: pair[1], reverse=True)
-
-    # 6. Take top k.
-    top_k = boosted[: request.k]
-
-    note_hits = [
-        RecallHit(
-            item_type="note",
-            id=note_id,
-            text=notes_by_id[note_id].text,
-            score=score,
-            provenance={
-                "tags": notes_by_id[note_id].tags,
-                "source_episode_ids": notes_by_id[note_id].source_episode_ids,
-                "valid_from": notes_by_id[note_id].valid_from,
-            },
-        )
-        for note_id, score in top_k
-    ]
-
-    # 7. Always also pull episode summaries.
+    # 3. Pull episode candidates now — they need to be in hand *before* fusing
+    #    so they can be fused as a ranker rather than bolted on afterwards (see below).
     #
     # We tried gating this on a "weak hits" heuristic, but with text-embedding-3-small
     # over a small corpus, scores cluster in a narrow 0.014-0.016 band regardless
     # of how relevant the hit actually is. Absolute thresholds and spread-based
     # signals both misfire. So instead we always pay the one extra DB query and
     # include episodes; the merged ranking surfaces whichever tier had the better
-    # match. The `depth` parameter now only controls whether we *also* expand
-    # into raw verbatim turns (depth=verbatim), which is genuinely expensive.
+    # match. The `depth` parameter only controls whether we *also* expand into
+    # raw verbatim turns (depth=verbatim), which is genuinely expensive.
     _t_ep = time.monotonic()
     episode_hits_raw = store.search_episodes_vector(query_embedding, k=config.deep_k)
     _ep_ms = (time.monotonic() - _t_ep) * 1000
@@ -195,23 +165,77 @@ def recall(
             max(ep_dists),
             _ep_ms,
         )
-    episode_hits = [
-        RecallHit(
-            item_type="episode",
-            id=ep.id,
-            text=ep.summary,
-            score=1.0 / (1.0 + dist),  # convert distance -> score
-            provenance={"source": ep.source, "started_at": ep.started_at},
-        )
-        for ep, dist in episode_hits_raw
+    episodes_filtered = [
+        (ep, dist) for ep, dist in episode_hits_raw
         if dist <= config.vector_distance_floor
     ]
-    note_hits.extend(episode_hits)
 
-    # Re-sort after extending so note and episode hits are interleaved by score
-    # rather than notes-first, episodes-last. Without this, a highly-relevant
-    # episode summary always ranks below every note hit regardless of score.
-    note_hits.sort(key=lambda h: h.score, reverse=True)
+    # 4. RRF fuse — notes (vector + BM25) and episodes (vector) all feed the SAME
+    #    fusion as parallel rankers, landing on the SAME score scale.
+    #
+    #    Previously episodes were scored via 1/(1+distance) (~0.4-0.9) while notes
+    #    were scored via RRF*recency (~0.01-0.03) — a ~30x scale gap. Any episode
+    #    with a merely-OK vector match would mathematically bury a note that was
+    #    the actual best answer (even one corroborated by BOTH BM25 and vector).
+    #    That gap was always there but didn't bite until the 2026-06-07 backfill
+    #    grew the note corpus enough to expose it (eval recall@k 96.3% -> 70.4%).
+    #    Folding episodes into the fusion as a third ranker means an item's TYPE
+    #    never decides the outcome — its RANK across the signals that found it does.
+    vector_ids = [n.id for n, _ in vector_hits]
+    bm25_ids = [n.id for n, _ in bm25_hits]
+    episode_ids = [ep.id for ep, _ in episodes_filtered]
+    fused = reciprocal_rank_fusion([vector_ids, bm25_ids, episode_ids], k_rrf=config.rrf_k)
+
+    # 5. Resolve ids back to source objects (note and episode id spaces don't collide — both ULIDs).
+    notes_by_id = {n.id: n for n, _ in vector_hits}
+    notes_by_id.update({n.id: n for n, _ in bm25_hits})
+    episodes_by_id = {ep.id: ep for ep, _ in episodes_filtered}
+
+    # 6. Apply recency boost uniformly (notes anchor on ingested_at, episodes on started_at).
+    half_life_seconds = max(1, config.recency_half_life_days * 86400)
+    boosted: list[tuple[str, float]] = []
+    for item_id, base_score in fused.items():
+        if item_id in notes_by_id:
+            anchor = notes_by_id[item_id].ingested_at
+        elif item_id in episodes_by_id:
+            anchor = episodes_by_id[item_id].started_at
+        else:
+            continue
+        age = max(0, (iso_to_dt(now) - iso_to_dt(anchor)).total_seconds())
+        boost = math.exp(-age / half_life_seconds)
+        boosted.append((item_id, base_score * boost))
+    boosted.sort(key=lambda pair: pair[1], reverse=True)
+
+    # 7. Take top k — notes and episodes interleaved by their true fused rank.
+    top_k = boosted[: request.k]
+    note_hits: list[RecallHit] = []
+    for item_id, score in top_k:
+        if item_id in notes_by_id:
+            note = notes_by_id[item_id]
+            note_hits.append(
+                RecallHit(
+                    item_type="note",
+                    id=item_id,
+                    text=note.text,
+                    score=score,
+                    provenance={
+                        "tags": note.tags,
+                        "source_episode_ids": note.source_episode_ids,
+                        "valid_from": note.valid_from,
+                    },
+                )
+            )
+        else:
+            ep = episodes_by_id[item_id]
+            note_hits.append(
+                RecallHit(
+                    item_type="episode",
+                    id=item_id,
+                    text=ep.summary,
+                    score=score,
+                    provenance={"source": ep.source, "started_at": ep.started_at},
+                )
+            )
 
     # Final relevance gate: drop anything below the absolute score floor.
     if config.final_score_floor > 0:
