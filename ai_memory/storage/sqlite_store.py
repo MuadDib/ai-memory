@@ -222,15 +222,21 @@ def _fts5_escape(query: str) -> str:
     all of that.
 
     Strategy: pull out alphanumeric tokens via regex, drop everything else,
-    and wrap each token in double-quotes so it's interpreted as a phrase.
-    Multiple phrases are AND'd by FTS5 default semantics, which matches
-    intuitive search behaviour.
+    and wrap each token in double-quotes so it's interpreted as a literal
+    term. Joined with OR: a real bag-of-words match needs only ONE shared
+    token, with bm25()'s IDF weighting naturally ranking notes that hit a
+    rare term (e.g. "Murphy", "gpt-4o-mini") above ones that only share
+    filler words ("tell", "about", "what"). The previous implicit-AND join
+    required EVERY token in the (often long, natural-language) query to
+    appear in the note — including stopwords no note would ever contain —
+    so BM25 silently returned zero candidates for nearly every recall query,
+    leaving vector search as the sole ranker and BM25 as dead weight.
     """
     import re
     tokens = re.findall(r"\w+", query, flags=re.UNICODE)
     if not tokens:
         return ""
-    return " ".join(f'"{t}"' for t in tokens)
+    return " OR ".join(f'"{t}"' for t in tokens)
 
 
 def _pack_vec(vec: list[float]) -> bytes:
@@ -267,6 +273,11 @@ class SqliteStore:
         conn.enable_load_extension(False)
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
+        # Without this, two processes touching the DB at once (e.g. a `serve`
+        # MCP connection and a CLI `eval`/`dream` invocation) raise "database
+        # is locked" immediately on any write contention. 5 s lets SQLite's
+        # own retry loop absorb normal short-lived writer overlap instead.
+        conn.execute("PRAGMA busy_timeout = 5000")
         conn.executescript(SCHEMA_SQL)
         conn.execute(
             f"CREATE VIRTUAL TABLE IF NOT EXISTS notes_vec "

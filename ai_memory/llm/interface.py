@@ -18,6 +18,31 @@ class Message(TypedDict):
     content: str
 
 
+class LlmError(RuntimeError):
+    """Base class for provider errors surfaced to the dreaming pipeline."""
+
+
+class LlmRateLimitError(LlmError):
+    """A 429 / rate-limit response from the provider.
+
+    `permanent` is True when the request can never succeed in its current
+    shape — e.g. OpenAI's "Request too large ... tokens per min (TPM)" where
+    the single request exceeds the *per-minute* token ceiling. Such requests
+    must be reshaped (chunked / map-reduced), never blindly retried.
+
+    `permanent` is False for ordinary throttling (too many requests for now);
+    the provider adapter retries those with backoff before giving up.
+    `retry_after` carries the provider's hint in seconds when present.
+    """
+
+    def __init__(
+        self, message: str, *, permanent: bool = False, retry_after: float | None = None
+    ) -> None:
+        super().__init__(message)
+        self.permanent = permanent
+        self.retry_after = retry_after
+
+
 @dataclass(frozen=True)
 class CompletionResult:
     text: str

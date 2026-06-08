@@ -151,9 +151,22 @@ llm:
 
 dream:
   long_episode_turns: 100      # episodes >= this many turns use quality_model for Phase 3
+  max_request_tokens: 25000    # per-request input ceiling (~4 chars/token). Larger
+                               # transcripts are summarised map-reduce so one episode
+                               # can never exceed the model's per-minute token (TPM)
+                               # limit. Keep this comfortably under your model's TPM.
+  rate_limit_max_retries: 5    # transient-429 retries before giving up on a call
+  rate_limit_backoff_seconds: 2.0  # base for exponential backoff between those retries
 ```
 
 All values have defaults — only override what you need. Full knob list in `ai_memory/config.py`.
+
+> **Rate limits & long episodes.** `quality_model` (e.g. `gpt-4o`) on a low-TPM
+> account is the classic deadlock trap: a single 800-turn episode's summary can
+> exceed the per-minute token limit and 429 forever. `max_request_tokens` caps
+> every Phase 3 request (summary is now map-reduced when oversized) and transient
+> 429s are retried with backoff, so the cycle stays resilient. See
+> [ADR-0013](docs/decisions/0013-dream-cycle-resilience-and-rate-limit-safety.md).
 
 ## Design principles
 

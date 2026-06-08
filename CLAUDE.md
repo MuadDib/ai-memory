@@ -32,6 +32,9 @@ Runtime data lives at `%LOCALAPPDATA%\ai-memory\` (`memory.db`, `profile.md`, `r
 - **`../shared-ai-memory-proposal.md`** — the canonical design doc. Versioned via changelog blocks at the top. v4 (2026-04-27 afternoon) covers the recall-quality debug arc and the open follow-ups; v3 covers the build session; v2 covers the pre-build design with research synthesis from six existing-memory-MCP deep-dives.
 - **`README.md`** — install/wiring instructions and the current command surface.
 - **`docs/porting-to-csharp.md`** — the portability discipline that shapes module boundaries. Honour it when adding new code; if you cross it, justify it in the PR or in the proposal doc.
+- **`docs/decisions/`** — ADRs (one decision per file). Latest: **[ADR-0013 — Dream-Cycle Resilience and Rate-Limit Safety](docs/decisions/0013-dream-cycle-resilience-and-rate-limit-safety.md)** (amends ADR-0007).
+- **`docs/reviews/`** — point-in-time health audits of the live corpus. Latest: **[2026-06-07 Memory Health Review](docs/reviews/2026-06-07-memory-health-review.md)**.
+- **`docs/plans/`** — actionable remediation/work plans. Active: **[Dream-Cycle Deadlock Remediation](docs/plans/2026-06-07-dream-deadlock-remediation.md)**.
 
 ## Stable contracts (don't change without eval data)
 
@@ -44,6 +47,20 @@ These are listed in proposal v3 + v4:
 - **Three-category extract prompt structure** (user / system / problems-and-fixes). Re-organising the categories silently re-biases extraction.
 
 ## Open follow-ups (priority order)
+
+> ⚠️ **INCIDENT 2026-06-07 — dream cycle was frozen since 2026-05-05 (code fixed; backfill in progress).**
+> A single oversized episode poison-pilled every pass (gpt-4o 30k-TPM 429); no per-episode
+> isolation; daemon retried the same doomed pass every 63 s → 841/985 episodes pending and 50k+
+> orphan `dream_log` rows. **Code fix landed** (per-episode isolation, map-reduced summary,
+> `max_request_tokens`, 429 backoff, daemon circuit breaker, journal-on-complete; + **single-flight
+> lock** on the dream pass so the PreCompact-hook/CLI path can't pile up concurrent dreams — the
+> daemon's pid-lock never covered it; 124 tests).
+> **Ops status:** ✅ `AiMemoryDream` service stopped · ✅ orphans cleaned (`dream_log` 50,367 → 54)
+> · 🔄 backlog draining via batched `scripts`/`drain.ps1` (`dream --max-episodes 25` loop; ~841 → ~600).
+> **Remaining:** finish the backfill to 0 pending, then `Start-Service AiMemoryDream`.
+> See [ADR-0013](docs/decisions/0013-dream-cycle-resilience-and-rate-limit-safety.md),
+> the [health review](docs/reviews/2026-06-07-memory-health-review.md), and the
+> [remediation plan](docs/plans/2026-06-07-dream-deadlock-remediation.md).
 
 1. **Pre-render redaction** — privacy filter runs before persistence, but the assembled transcript still has raw creds when sent to OpenAI for dream cycles.
 2. **Phase 4 contradiction detection** — `invalidated` count is low; the mid-band LLM verdict prompt needs more signal for genuine contradictions. Needs eval cases.

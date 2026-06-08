@@ -47,6 +47,18 @@ class LlmConfig:
     # use `model`.  Example: "gpt-4o" when base is "gpt-4o-mini".
     quality_model: str = ""
 
+    # Cross-model confirmation for destructive contradictions (ADR-0014 §2).
+    # When set, a Phase 4 CONTRADICTS verdict only SUPERSEDES the existing note
+    # if this second, ideally different-family model ALSO returns CONTRADICTS;
+    # otherwise the pair is quarantined (both kept, linked). Leave empty to
+    # quarantine ALL contradictions (the safe default — no unattended destroy).
+    # `confirm_provider` lets the confirmer come from a different family than
+    # `provider` (model diversity is what catches a systematic single-model bias).
+    # Example: provider=openai/model=gpt-4o-mini with confirm_provider=anthropic/
+    # contradiction_confirm_model=claude-sonnet-4-6.
+    contradiction_confirm_model: str = ""
+    confirm_provider: Literal["anthropic", "openai"] = "anthropic"
+
 
 @dataclass(frozen=True)
 class DreamConfig:
@@ -62,6 +74,27 @@ class DreamConfig:
     # Turn count at or above which the quality_model is used for Phase 3
     # extraction on that episode.  0 = never upgrade.
     long_episode_turns: int = 100
+    # Hard ceiling on the input size (in tokens, ~4 chars each) of any single
+    # Phase 3 LLM request.  Transcripts larger than this are summarised
+    # map-reduce (chunk -> merge) instead of single-shot, so one long episode
+    # can never emit a request bigger than the provider's per-minute token
+    # limit (a 142k-token request to a 30k-TPM model is a permanent 429).
+    # Keep this comfortably under the selected model's TPM ceiling.
+    max_request_tokens: int = 25000
+    # Transient-429 backoff: how many times a single LLM call retries on a
+    # rate-limit before giving up, and the base seconds for exponential backoff.
+    rate_limit_max_retries: int = 5
+    rate_limit_backoff_seconds: float = 2.0
+
+    # ADR-0014 §5 conviction-gated resolution of quarantined contradictions.
+    # When enabled, a periodic pass re-confirms each quarantined contradiction is
+    # genuine, then supersedes the lower-conviction side IF the conviction gap
+    # exceeds `contradiction_resolution_min_gap` AND the winner fully covers the
+    # loser (§3). Off by default — quarantined pairs simply persist (both kept,
+    # linked) until enabled. Conviction = distinct source episodes + access_count
+    # + a promoted bonus + a recency term.
+    resolve_contradictions: bool = False
+    contradiction_resolution_min_gap: float = 3.0
 
 
 @dataclass(frozen=True)
@@ -89,6 +122,33 @@ class RecallConfig:
     # distribution before tightening.
     vector_distance_floor: float = 1.1
     final_score_floor: float = 0.0  # post-RRF/recency cutoff (0 = keep everything fused)
+
+    # Recall-quality follow-up #1 — optional LLM cross-encoder rerank. The fused
+    # RRF ranking retrieves the right note but often lands it just below k (a
+    # natural-language question embeds far from the terse fact that answers it).
+    # When enabled, the top `rerank_candidates` fused hits are re-scored by an LLM
+    # jointly reading (query, candidate) and re-sorted before the top-k cut.
+    # OFF by default: keeps the recall hot path LLM-free per the architecture
+    # ("heavy LLM work happens in dream cycles, never on the recall hot path").
+    # Turn on when top-k precision matters more than the added latency/cost.
+    rerank_enabled: bool = False
+    rerank_candidates: int = 20
+
+    # Recall-quality follow-up #2 — optional HyDE (Hypothetical Document
+    # Embeddings). An interrogative query ("what company does Igor work for")
+    # embeds far from the terse declarative fact that answers it ("Role: ... at
+    # Citywire"). When enabled, the LLM writes a short hypothetical ANSWER and we
+    # vector-search on THAT embedding instead of the question's. BM25 still uses
+    # the raw query text. OFF by default (same hot-path reasoning as rerank);
+    # fail-safe to the plain query embedding on any error.
+    hyde_enabled: bool = False
+
+    # Recall-quality follow-up #3 — conviction-aware ranking. Beyond recency, give
+    # a gentle multiplicative boost to notes corroborated by multiple source
+    # episodes and reinforced by past recall (access_count), so a well-established
+    # canonical fact outranks a one-off near-duplicate. Always on; set to 0 to
+    # disable. Applied to notes only (episodes have no such signal).
+    conviction_weight: float = 0.2
 
 
 @dataclass(frozen=True)

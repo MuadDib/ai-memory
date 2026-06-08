@@ -1,6 +1,6 @@
 """
-Recall pipeline: hybrid search (BM25 + vector) fused with Reciprocal Rank Fusion,
-soft-boosted by recency.
+Recall pipeline: hybrid search (BM25 + vector, over both notes AND episodes)
+fused with Reciprocal Rank Fusion, soft-boosted by recency.
 
 Three depths:
     - "fast"     -> profile + top-k notes
@@ -12,6 +12,14 @@ RRF formula:
 
 We use k_rrf = 60 (the value Supermemory found generalises well).
 
+Notes and episodes are fused through this SAME formula, as parallel rankers
+(note-vector, note-BM25, episode-vector), so an item's TYPE never decides the
+final ranking by scale artifact — only its RANK across the signals that found
+it does. (An earlier version scored episodes via 1/(1+distance), landing on a
+~30x larger scale than notes' RRF*recency scores; that let weakly-related
+episodes mathematically bury well-corroborated notes once the corpus grew —
+see the regression test in test_recall_merge.py for the concrete scenario.)
+
 Recency boost:
     boost(doc) = exp(- age_days / half_life_days)
     final     = rrf_score * boost
@@ -21,6 +29,7 @@ so the ranker-internal scores remain comparable.
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
@@ -30,10 +39,12 @@ from typing import TYPE_CHECKING
 from ai_memory.config import RecallConfig
 from ai_memory.core.models import RecallHit
 from ai_memory.embeddings.interface import Embedder
+from ai_memory.llm.interface import Message
 from ai_memory.storage.raw_files import RawTranscriptStore
 from ai_memory.timestamps import iso_to_dt, now_iso
 
 if TYPE_CHECKING:
+    from ai_memory.llm.interface import Llm
     from ai_memory.storage.interface import MemoryStore
 
 
@@ -67,6 +78,98 @@ def reciprocal_rank_fusion(
     return scores
 
 
+RERANK_SYSTEM = (
+    "You are a search reranker (a cross-encoder). Given a QUERY and a numbered "
+    "list of candidate memory facts, return the candidate indices ordered from "
+    "MOST to LEAST relevant for ANSWERING the query. Judge whether each candidate "
+    "actually answers or directly informs the query — not mere topical overlap. "
+    "A specific, direct answer outranks a general or tangential mention. Include "
+    "every index exactly once.\n"
+    'Output JSON only: {"order": [<index>, <index>, ...]}.'
+)
+
+
+def _llm_rerank(
+    *, llm: "Llm", query: str, hits: list[RecallHit], top_n: int
+) -> list[RecallHit]:
+    """LLM cross-encoder rerank of the top `top_n` hits (the rest are left in place
+    after them). Returns a reordered hits list. Fail-safe: returns the input
+    UNCHANGED on any error or invalid output — reranking must never drop a hit."""
+    pool = hits[:top_n]
+    if len(pool) < 2:
+        return hits
+    payload = {
+        "query": query,
+        "candidates": [{"i": i, "text": h.text[:400]} for i, h in enumerate(pool)],
+    }
+    try:
+        completion = llm.complete(
+            system=RERANK_SYSTEM,
+            messages=[Message(role="user", content=json.dumps(payload, ensure_ascii=False))],
+            max_tokens=256,
+        )
+        text = completion.text
+        s, e = text.find("{"), text.rfind("}")
+        order = json.loads(text[s:e + 1]).get("order") if s != -1 and e != -1 else None
+        if not isinstance(order, list):
+            return hits
+        reordered: list[RecallHit] = []
+        seen: set[int] = set()
+        for idx in order:
+            if isinstance(idx, int) and 0 <= idx < len(pool) and idx not in seen:
+                reordered.append(pool[idx])
+                seen.add(idx)
+        for i, h in enumerate(pool):  # append any indices the model omitted
+            if i not in seen:
+                reordered.append(h)
+        return reordered + hits[top_n:]
+    except Exception:  # malformed JSON / provider error — keep the fused order
+        logger.warning("rerank failed; falling back to fused order", exc_info=False)
+        return hits
+
+
+HYDE_SYSTEM = (
+    "You help a memory search engine. Given a QUESTION, write ONE short, plausible "
+    "declarative sentence that would directly ANSWER it — phrased as a stored fact, "
+    "not a question. Invent reasonable specifics if needed; this text is only used "
+    "to steer vector search toward the answer's phrasing and is never shown to "
+    "anyone. Output the single sentence only, no preamble."
+)
+
+
+def _hyde_embedding(
+    *, llm: "Llm", embedder: Embedder, query: str
+) -> list[float] | None:
+    """HyDE (#2): embed a hypothetical ANSWER to the query rather than the question,
+    bridging the interrogative-query / declarative-fact gap. Returns the embedding,
+    or None on any failure so the caller falls back to the plain query embedding."""
+    try:
+        completion = llm.complete(
+            system=HYDE_SYSTEM,
+            messages=[Message(role="user", content=query)],
+            max_tokens=80,
+        )
+        hypo = (completion.text or "").strip()
+        if not hypo:
+            return None
+        [emb] = embedder.embed([hypo])
+        return emb
+    except Exception:
+        logger.warning("HyDE failed; falling back to plain query embedding", exc_info=False)
+        return None
+
+
+def _conviction_boost(*, access_count: int, source_episodes: int, weight: float) -> float:
+    """Recall ranking boost (#3): reward facts corroborated by multiple source
+    episodes and reinforced by past recall. A gentle multiplicative nudge >= 1.0
+    (log-scaled so a handful of corroborations helps without one popular note
+    dominating). weight=0 disables it (returns 1.0)."""
+    if weight <= 0:
+        return 1.0
+    signal = max(0, access_count) + max(0, source_episodes)
+    return 1.0 + weight * math.log1p(signal)
+
+
 def recall(
     *,
     store: "MemoryStore",
@@ -74,6 +177,7 @@ def recall(
     embedder: Embedder,
     config: RecallConfig,
     request: RecallRequest,
+    llm: "Llm | None" = None,
     now: str | None = None,
 ) -> list[RecallHit]:
     """Run the recall pipeline. Returns a ranked list of hits."""
@@ -85,8 +189,14 @@ def recall(
     #    but that caused deadlocks when multiple recall threads accessed the shared
     #    sqlite3 connection concurrently (sqlite3 connections are not thread-safe).
     #    The ~5 ms BM25 saving is not worth the complexity; keep it sequential.
+    #    With HyDE (#2, off by default) we vector-search on a hypothetical ANSWER's
+    #    embedding instead of the question's; BM25 below still uses the raw query.
     _t_embed = time.monotonic()
-    [query_embedding] = embedder.embed([request.query])
+    query_embedding = None
+    if config.hyde_enabled and llm is not None:
+        query_embedding = _hyde_embedding(llm=llm, embedder=embedder, query=request.query)
+    if query_embedding is None:
+        [query_embedding] = embedder.embed([request.query])
     _embed_ms = (time.monotonic() - _t_embed) * 1000
 
     # 2. BM25 (sequential, safe — single thread per recall invocation).
@@ -134,54 +244,16 @@ def recall(
         if dist <= config.vector_distance_floor
     ]
 
-    # 3. RRF fuse.
-    vector_ids = [n.id for n, _ in vector_hits]
-    bm25_ids = [n.id for n, _ in bm25_hits]
-    fused = reciprocal_rank_fusion([vector_ids, bm25_ids], k_rrf=config.rrf_k)
-
-    # 4. Resolve back to Note objects (one of the rankers will have it).
-    notes_by_id = {n.id: n for n, _ in vector_hits}
-    notes_by_id.update({n.id: n for n, _ in bm25_hits})
-
-    # 5. Apply recency boost.
-    half_life_seconds = max(1, config.recency_half_life_days * 86400)
-    boosted: list[tuple[str, float]] = []
-    for note_id, base_score in fused.items():
-        note = notes_by_id.get(note_id)
-        if note is None:
-            continue
-        age = max(0, (iso_to_dt(now) - iso_to_dt(note.ingested_at)).total_seconds())
-        boost = math.exp(-age / half_life_seconds)
-        boosted.append((note_id, base_score * boost))
-    boosted.sort(key=lambda pair: pair[1], reverse=True)
-
-    # 6. Take top k.
-    top_k = boosted[: request.k]
-
-    note_hits = [
-        RecallHit(
-            item_type="note",
-            id=note_id,
-            text=notes_by_id[note_id].text,
-            score=score,
-            provenance={
-                "tags": notes_by_id[note_id].tags,
-                "source_episode_ids": notes_by_id[note_id].source_episode_ids,
-                "valid_from": notes_by_id[note_id].valid_from,
-            },
-        )
-        for note_id, score in top_k
-    ]
-
-    # 7. Always also pull episode summaries.
+    # 3. Pull episode candidates now — they need to be in hand *before* fusing
+    #    so they can be fused as a ranker rather than bolted on afterwards (see below).
     #
     # We tried gating this on a "weak hits" heuristic, but with text-embedding-3-small
     # over a small corpus, scores cluster in a narrow 0.014-0.016 band regardless
     # of how relevant the hit actually is. Absolute thresholds and spread-based
     # signals both misfire. So instead we always pay the one extra DB query and
     # include episodes; the merged ranking surfaces whichever tier had the better
-    # match. The `depth` parameter now only controls whether we *also* expand
-    # into raw verbatim turns (depth=verbatim), which is genuinely expensive.
+    # match. The `depth` parameter only controls whether we *also* expand into
+    # raw verbatim turns (depth=verbatim), which is genuinely expensive.
     _t_ep = time.monotonic()
     episode_hits_raw = store.search_episodes_vector(query_embedding, k=config.deep_k)
     _ep_ms = (time.monotonic() - _t_ep) * 1000
@@ -195,27 +267,102 @@ def recall(
             max(ep_dists),
             _ep_ms,
         )
-    episode_hits = [
-        RecallHit(
-            item_type="episode",
-            id=ep.id,
-            text=ep.summary,
-            score=1.0 / (1.0 + dist),  # convert distance -> score
-            provenance={"source": ep.source, "started_at": ep.started_at},
-        )
-        for ep, dist in episode_hits_raw
+    episodes_filtered = [
+        (ep, dist) for ep, dist in episode_hits_raw
         if dist <= config.vector_distance_floor
     ]
-    note_hits.extend(episode_hits)
 
-    # Re-sort after extending so note and episode hits are interleaved by score
-    # rather than notes-first, episodes-last. Without this, a highly-relevant
-    # episode summary always ranks below every note hit regardless of score.
-    note_hits.sort(key=lambda h: h.score, reverse=True)
+    # 4. RRF fuse — notes (vector + BM25) and episodes (vector) all feed the SAME
+    #    fusion as parallel rankers, landing on the SAME score scale.
+    #
+    #    Previously episodes were scored via 1/(1+distance) (~0.4-0.9) while notes
+    #    were scored via RRF*recency (~0.01-0.03) — a ~30x scale gap. Any episode
+    #    with a merely-OK vector match would mathematically bury a note that was
+    #    the actual best answer (even one corroborated by BOTH BM25 and vector).
+    #    That gap was always there but didn't bite until the 2026-06-07 backfill
+    #    grew the note corpus enough to expose it (eval recall@k 96.3% -> 70.4%).
+    #    Folding episodes into the fusion as a third ranker means an item's TYPE
+    #    never decides the outcome — its RANK across the signals that found it does.
+    vector_ids = [n.id for n, _ in vector_hits]
+    bm25_ids = [n.id for n, _ in bm25_hits]
+    episode_ids = [ep.id for ep, _ in episodes_filtered]
+    fused = reciprocal_rank_fusion([vector_ids, bm25_ids, episode_ids], k_rrf=config.rrf_k)
 
-    # Final relevance gate: drop anything below the absolute score floor.
+    # 5. Resolve ids back to source objects (note and episode id spaces don't collide — both ULIDs).
+    notes_by_id = {n.id: n for n, _ in vector_hits}
+    notes_by_id.update({n.id: n for n, _ in bm25_hits})
+    episodes_by_id = {ep.id: ep for ep, _ in episodes_filtered}
+
+    # 6. Apply recency boost uniformly (notes anchor on ingested_at, episodes on started_at).
+    half_life_seconds = max(1, config.recency_half_life_days * 86400)
+    boosted: list[tuple[str, float]] = []
+    for item_id, base_score in fused.items():
+        if item_id in notes_by_id:
+            note = notes_by_id[item_id]
+            anchor = note.ingested_at
+            # #3 conviction boost: corroboration (source episodes) + reinforcement
+            # (access_count). Notes only; episodes have no comparable signal.
+            conviction = _conviction_boost(
+                access_count=note.access_count,
+                source_episodes=len(note.source_episode_ids),
+                weight=config.conviction_weight,
+            )
+        elif item_id in episodes_by_id:
+            anchor = episodes_by_id[item_id].started_at
+            conviction = 1.0
+        else:
+            continue
+        age = max(0, (iso_to_dt(now) - iso_to_dt(anchor)).total_seconds())
+        boost = math.exp(-age / half_life_seconds)
+        boosted.append((item_id, base_score * boost * conviction))
+    boosted.sort(key=lambda pair: pair[1], reverse=True)
+
+    # 7. Take a candidate pool. When rerank is enabled we keep a WIDER pool
+    #    (`rerank_candidates`) so the LLM cross-encoder can pull a just-below-k
+    #    answer up into the top k; otherwise the pool is exactly k.
+    rerank_on = config.rerank_enabled and llm is not None
+    pool_n = max(request.k, config.rerank_candidates) if rerank_on else request.k
+    top_k = boosted[:pool_n]
+    note_hits: list[RecallHit] = []
+    for item_id, score in top_k:
+        if item_id in notes_by_id:
+            note = notes_by_id[item_id]
+            note_hits.append(
+                RecallHit(
+                    item_type="note",
+                    id=item_id,
+                    text=note.text,
+                    score=score,
+                    provenance={
+                        "tags": note.tags,
+                        "source_episode_ids": note.source_episode_ids,
+                        "valid_from": note.valid_from,
+                    },
+                )
+            )
+        else:
+            ep = episodes_by_id[item_id]
+            note_hits.append(
+                RecallHit(
+                    item_type="episode",
+                    id=item_id,
+                    text=ep.summary,
+                    score=score,
+                    provenance={"source": ep.source, "started_at": ep.started_at},
+                )
+            )
+
+    # Final relevance gate: drop anything below the absolute score floor (applied
+    # on the fused*recency score, before any rerank reorders the survivors).
     if config.final_score_floor > 0:
         note_hits = [h for h in note_hits if h.score >= config.final_score_floor]
+
+    # 7b. Cross-encoder rerank the wider pool, then cut to k (#1, off by default).
+    if rerank_on:
+        note_hits = _llm_rerank(
+            llm=llm, query=request.query, hits=note_hits, top_n=pool_n
+        )
+    note_hits = note_hits[: request.k]
 
     # 8. For "verbatim" — pull the underlying turns for the top episodes.
     if request.depth == "verbatim":
