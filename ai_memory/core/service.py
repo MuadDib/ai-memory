@@ -205,7 +205,7 @@ class MemoryService:
                 episodes_failed=0,
             )
         try:
-            return _dreaming.dream(
+            report = _dreaming.dream(
                 store=self.store,
                 raw=self.raw,
                 embedder=self.embedder,
@@ -219,6 +219,11 @@ class MemoryService:
             )
         finally:
             lock.release()
+        # Phase 5 promotes via the store directly, bypassing upsert_profile —
+        # refresh the profile.md mirror here or it silently goes stale.
+        if report.notes_promoted_to_profile:
+            self._regenerate_profile_md()
+        return report
 
     def upsert_profile(self, key: str, value: str, source: str | None = None) -> None:
         """Insert / update a profile fact and re-mirror to profile.md."""
@@ -255,8 +260,17 @@ class MemoryService:
 
     def _regenerate_profile_md(self) -> None:
         """Rewrite profile.md as a human-readable mirror of the profile table."""
-        rows = sorted(self.store.list_profile(), key=lambda p: p.key)
-        lines = ["# Profile (auto-generated)\n"]
-        for row in rows:
-            lines.append(f"- **{row.key}**: {row.value}")
-        self.config.profile_md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.config.profile_md_path.write_text(
+            render_profile_markdown(self.store.list_profile()), encoding="utf-8"
+        )
+
+
+def render_profile_markdown(rows: list[Profile]) -> str:
+    """The profile as a markdown bullet list — shared by profile.md, the
+    `memory://profile` resource and the MCP server instructions."""
+    if not rows:
+        return "# Profile\n\n_(empty)_\n"
+    lines = ["# Profile (auto-generated)\n"]
+    for row in sorted(rows, key=lambda p: p.key):
+        lines.append(f"- **{row.key}**: {row.value}")
+    return "\n".join(lines) + "\n"

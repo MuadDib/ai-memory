@@ -38,6 +38,7 @@ from pydantic import BaseModel, ValidationError
 from ai_memory.config import DreamConfig
 from ai_memory.core.models import DreamLog, Note, Profile
 from ai_memory.embeddings.interface import Embedder
+from ai_memory.harness_markup import strip_injected
 from ai_memory.llm.interface import CompletionResult, Llm, Message
 from ai_memory.storage.raw_files import RawTranscriptStore
 from ai_memory.timestamps import iso_to_dt, now_iso
@@ -1268,6 +1269,9 @@ def _render_transcript(raw: RawTranscriptStore, turns: Iterable) -> str:
         payload = raw.read_turn(turn.raw_file, turn.byte_offset, turn.byte_length)
         role = payload.get("role", "user")
         text = payload.get("text", "")
+        if role == "user":
+            # Turns imported before ADR-0015 still carry harness boilerplate.
+            text = strip_injected(text)
         lines.append(f"<turn n={index} role={role}>")
         lines.append(text)
         lines.append("</turn>")

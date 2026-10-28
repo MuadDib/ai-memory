@@ -11,30 +11,39 @@
 #    hook returns immediately and does not block compaction. Output goes to
 #    a dedicated log file.
 
+# Data lives outside AppData: the Claude desktop app is an MSIX package and
+# redirects new AppData folders into its private LocalCache.
+$env:AI_MEMORY_HOME = "C:\ai-mem\data"
 $ErrorActionPreference = "SilentlyContinue"
 
 $aiMemory  = "C:\ai-mem\ai-memory\.venv\Scripts\ai-memory.exe"
-$logFile   = "$env:LOCALAPPDATA\ai-memory\logs\hook-precompact.log"
-$dreamLog  = "$env:LOCALAPPDATA\ai-memory\logs\dream-async.log"
+$logFile   = "$env:AI_MEMORY_HOME\logs\hook-precompact.log"
+$dreamLog  = "$env:AI_MEMORY_HOME\logs\dream-async.log"
 
 try {
     $claudeRoot = "$env:USERPROFILE\.claude\projects"
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     "[$ts] pre-compact: import-cowork --root $claudeRoot" | Add-Content -Path $logFile -Encoding UTF8
-    & $aiMemory import-cowork --root $claudeRoot 2>&1 | Add-Content -Path $logFile -Encoding UTF8
+    # SilentlyContinue drops native stderr before 2>&1 can capture it, which
+    # hid every traceback — use Continue for the call so failures reach the log.
+    $ErrorActionPreference = "Continue"
+    & $aiMemory import-cowork --root $claudeRoot 2>&1 | ForEach-Object { "$_" } | Add-Content -Path $logFile -Encoding UTF8
+    "[$ts] pre-compact: import-cowork exit=$LASTEXITCODE" | Add-Content -Path $logFile -Encoding UTF8
+    $ErrorActionPreference = "SilentlyContinue"
 
     # Spawn dream as a fully detached process — no parent/child relationship,
     # returns before dream finishes, does not block compaction.
     "[$ts] pre-compact: spawning dream async (log: $dreamLog)" |
         Add-Content -Path $logFile -Encoding UTF8
 
+    # Redirect via cmd.exe to the log file: redirecting to .NET pipes that
+    # nobody reads loses the output and can stall or kill dream once the
+    # pipe fills or this hook exits.
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName        = $aiMemory
-    $psi.Arguments       = "dream --trigger idle"
+    $psi.FileName        = "cmd.exe"
+    $psi.Arguments       = "/c `"`"$aiMemory`" dream --trigger idle >> `"$dreamLog`" 2>&1`""
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow  = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError  = $true
 
     $proc = [System.Diagnostics.Process]::Start($psi)
     # Don't wait — fire and forget. Dream runs independently.

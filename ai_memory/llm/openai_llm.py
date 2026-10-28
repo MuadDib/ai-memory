@@ -15,11 +15,11 @@ the caller reshapes the request (chunk / map-reduce) instead of hammering it.
 from __future__ import annotations
 
 import logging
-import os
 import time
 
 from openai import APIStatusError, OpenAI
 
+from ai_memory.env import get_env
 from ai_memory.llm.interface import CompletionResult, LlmRateLimitError, Message
 
 logger = logging.getLogger(__name__)
@@ -36,7 +36,7 @@ class OpenAILlm:
         max_retries: int = 5,
         backoff_seconds: float = 2.0,
     ) -> None:
-        api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        api_key = api_key or get_env("OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError(
                 "OpenAI API key not set. Provide one via the OPENAI_API_KEY "

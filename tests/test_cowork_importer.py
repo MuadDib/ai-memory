@@ -6,17 +6,21 @@ integration test once we have a fixture session file.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from ai_memory.cowork_importer import (
+    _coerce_turn,
+    _derive_title,
     _flatten_blocks,
     _iter_session_files,
     _normalise_content,
     _parse_timestamp,
+    import_cowork_sessions,
 )
-
 
 # --- _iter_session_files layout coverage -----------------------------------
 
@@ -165,3 +169,113 @@ def test_parse_timestamp_none() -> None:
 
 def test_parse_timestamp_garbage() -> None:
     assert _parse_timestamp("not a date") is None
+
+
+# --- Harness boilerplate stripping (ADR-0015) --------------------------------
+
+_REMINDER = "<system-reminder>\nContents of CLAUDE.md: be direct\n</system-reminder>"
+
+
+def _line(uuid: str, kind: str, content, ts: str = "2026-10-10T20:00:00Z") -> dict:
+    return {"type": kind, "uuid": uuid, "timestamp": ts, "message": {"content": content}}
+
+
+def test_coerce_user_turn_strips_reminder() -> None:
+    turn = _coerce_turn(
+        _line("u1", "user", f"{_REMINDER}\n\nlet's fix ai-memory"),
+        include_tools=False, jsonl_stem="s",
+    )
+    assert turn is not None and turn["text"] == "let's fix ai-memory"
+
+
+def test_coerce_reminder_only_user_turn_is_dropped() -> None:
+    # Claude Code attaches reminders as a text block next to tool_result blocks.
+    content = [{"type": "tool_result", "content": "ok"}, {"type": "text", "text": _REMINDER}]
+    assert _coerce_turn(_line("u1", "user", content), include_tools=False, jsonl_stem="s") is None
+
+
+def test_coerce_assistant_turn_untouched() -> None:
+    turn = _coerce_turn(
+        _line("a1", "assistant", [{"type": "text", "text": f"quoting {_REMINDER}"}]),
+        include_tools=False, jsonl_stem="s",
+    )
+    assert turn is not None and "<system-reminder>" in turn["text"]
+
+
+def test_derive_title_skips_wrapper_only_turns() -> None:
+    turns = [
+        {"role": "user", "text": "<task-notification><status>done</status></task-notification>"},
+        {"role": "assistant", "text": "noted"},
+        {"role": "user", "text": "now retitle the episodes"},
+    ]
+    assert _derive_title(Path("sess.jsonl"), turns) == "now retitle the episodes"
+
+
+def test_derive_title_falls_back_to_stem() -> None:
+    assert _derive_title(Path("sess.jsonl"), [{"role": "assistant", "text": "hi"}]) == "sess"
+
+
+# --- End-to-end import against a temp store ----------------------------------
+
+
+def _write_session(path: Path, lines: list[dict]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(json.dumps(x) for x in lines) + "\n", encoding="utf-8")
+    return path
+
+
+@pytest.fixture()
+def service(tmp_path: Path):
+    pytest.importorskip("sqlite_vec")
+    from ai_memory.storage.raw_files import RawTranscriptStore
+    from ai_memory.storage.sqlite_store import SqliteStore
+
+    store = SqliteStore(tmp_path / "memory.db", embedding_dim=4)
+    store.initialise()
+    yield SimpleNamespace(store=store, raw=RawTranscriptStore(tmp_path / "raw"))
+    store.close()
+
+
+def test_import_stores_clean_text_and_title(service, tmp_path: Path) -> None:
+    root = tmp_path / "projects"
+    _write_session(root / "proj" / "sess1.jsonl", [
+        _line("u1", "user", f"{_REMINDER}\n\nlet's fix ai-memory"),
+        _line("a1", "assistant", [{"type": "text", "text": "on it"}]),
+        _line("u2", "user", [{"type": "tool_result", "content": "x"}, {"type": "text", "text": _REMINDER}]),
+    ])
+
+    result = import_cowork_sessions(service=service, root=root)
+
+    assert result.turns_inserted == 2  # reminder-only u2 dropped
+    episode = service.store.get_episode("sess1")
+    assert episode.title == "let's fix ai-memory"
+    texts = [
+        service.raw.read_turn(t.raw_file, t.byte_offset, t.byte_length)["text"]
+        for t in service.store.get_turns_for_episode("sess1")
+    ]
+    assert texts == ["let's fix ai-memory", "on it"]
+
+
+def test_linear_scan_resumes_past_reminder_only_watermark(service, tmp_path: Path) -> None:
+    # State written by the pre-ADR-0015 importer, whose watermark is a turn that
+    # now strips to nothing. Force the linear-scan path (offset past EOF).
+    from ai_memory.core.models import CoworkImportState
+
+    root = tmp_path / "projects"
+    _write_session(root / "proj" / "sess2.jsonl", [
+        _line("u1", "user", "hello"),
+        _line("u2", "user", _REMINDER),
+        _line("a2", "assistant", [{"type": "text", "text": "new reply"}]),
+    ])
+    import_cowork_sessions(service=service, root=root)  # creates the episode
+    service.store.upsert_cowork_import_state(CoworkImportState(
+        session_id="sess2", last_turn_id="u2", last_byte_offset=10**9,
+        last_imported_at="2026-10-10T20:00:00Z",
+    ))
+    service.store.conn.execute("DELETE FROM turns WHERE id = 'a2'")
+    service.store.conn.commit()
+
+    result = import_cowork_sessions(service=service, root=root)
+
+    assert result.sessions_extended == 1 and result.turns_inserted == 1
+    assert service.store.get_cowork_import_state("sess2").last_turn_id == "a2"

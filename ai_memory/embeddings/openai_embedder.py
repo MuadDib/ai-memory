@@ -9,10 +9,11 @@ Cost reference (April 2026): roughly $0.02 per 1M input tokens.
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 
 from openai import APIStatusError, OpenAI
+
+from ai_memory.env import get_env
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,7 @@ class OpenAIEmbedder:
         dimensions: int = 1536,
         api_key: str | None = None,
     ) -> None:
-        api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        api_key = api_key or get_env("OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError(
                 "OpenAI API key not set. Provide one via the OPENAI_API_KEY "

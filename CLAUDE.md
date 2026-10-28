@@ -32,7 +32,7 @@ Runtime data lives at `%LOCALAPPDATA%\ai-memory\` (`memory.db`, `profile.md`, `r
 - **`../shared-ai-memory-proposal.md`** — the canonical design doc. Versioned via changelog blocks at the top. v4 (2026-04-27 afternoon) covers the recall-quality debug arc and the open follow-ups; v3 covers the build session; v2 covers the pre-build design with research synthesis from six existing-memory-MCP deep-dives.
 - **`README.md`** — install/wiring instructions and the current command surface.
 - **`docs/porting-to-csharp.md`** — the portability discipline that shapes module boundaries. Honour it when adding new code; if you cross it, justify it in the PR or in the proposal doc.
-- **`docs/decisions/`** — ADRs (one decision per file). Latest: **[ADR-0013 — Dream-Cycle Resilience and Rate-Limit Safety](docs/decisions/0013-dream-cycle-resilience-and-rate-limit-safety.md)** (amends ADR-0007).
+- **`docs/decisions/`** — ADRs (one decision per file). Latest: **[ADR-0015 — Strip Harness-Injected Markup from User Turns](docs/decisions/0015-strip-harness-injected-markup.md)**.
 - **`docs/reviews/`** — point-in-time health audits of the live corpus. Latest: **[2026-06-07 Memory Health Review](docs/reviews/2026-06-07-memory-health-review.md)**.
 - **`docs/plans/`** — actionable remediation/work plans. Active: **[Dream-Cycle Deadlock Remediation](docs/plans/2026-06-07-dream-deadlock-remediation.md)**.
 

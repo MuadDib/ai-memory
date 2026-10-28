@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ai_memory.core.models import CoworkImportState, Episode, Turn
+from ai_memory.harness_markup import strip_injected, title_candidate
 from ai_memory.timestamps import now_iso, unix_to_iso
 
 logger = logging.getLogger(__name__)
@@ -207,15 +208,21 @@ def _import_one_session(
                 continue
 
             turn_payload = _coerce_turn(obj, include_tools=include_tools, jsonl_stem=jsonl_path.stem)
-            if turn_payload is None:
-                continue
 
             # If we're in linear-scan resume mode, skip until we cross last_turn_id.
+            # Match on the source id too: a watermark turn imported before
+            # boilerplate stripping may now coerce to None (reminder-only text).
             if skipping_until_resume:
-                if turn_payload["id"] == resume_after_id:
+                if resume_after_id in (
+                    _source_turn_id(obj),
+                    turn_payload["id"] if turn_payload else None,
+                ):
                     skipping_until_resume = False
                     final_offset = line_end
-                    final_turn_id = turn_payload["id"]
+                    final_turn_id = resume_after_id
+                continue
+
+            if turn_payload is None:
                 continue
 
             new_turns.append({**turn_payload, "_line_start": line_start, "_line_end": line_end})
@@ -352,10 +359,14 @@ def _coerce_turn(obj: dict, *, include_tools: bool, jsonl_stem: str) -> dict | N
     message = obj.get("message") or {}
     content_blocks = _normalise_content(message.get("content"))
     text = _flatten_blocks(content_blocks, include_tools=include_tools).strip()
+    if event_type == "user":
+        # Harness-injected boilerplate (ADR-0015). A turn that was nothing but
+        # reminders (common next to tool_result blocks) is dropped entirely.
+        text = strip_injected(text)
     if not text:
         return None
 
-    turn_id = obj.get("uuid") or message.get("id") or obj.get("id")
+    turn_id = _source_turn_id(obj)
     if not turn_id:
         # Deterministic fallback: hash the line for stable identity across runs.
         import hashlib
@@ -369,6 +380,13 @@ def _coerce_turn(obj: dict, *, include_tools: bool, jsonl_stem: str) -> dict | N
         "ts": ts,
         "text": text,
     }
+
+
+def _source_turn_id(obj: dict) -> str | None:
+    """The transcript's own id for a line, if it carries one."""
+    message = obj.get("message") or {}
+    turn_id = obj.get("uuid") or message.get("id") or obj.get("id")
+    return str(turn_id) if turn_id else None
 
 
 def _normalise_content(raw) -> list:
@@ -430,8 +448,11 @@ def _parse_timestamp(value) -> str | None:
 
 
 def _derive_title(jsonl_path: Path, turns: list[dict]) -> str:
-    """Pick a short title from the first user turn, or fall back to the filename."""
+    """Pick a short title from the first user turn with the user's own words
+    (skipping harness wrappers — see harness_markup), else the filename."""
     for turn in turns:
         if turn["role"] == "user" and turn["text"]:
-            return turn["text"].split("\n", 1)[0][:80]
+            candidate = title_candidate(turn["text"])
+            if candidate:
+                return candidate
     return jsonl_path.stem

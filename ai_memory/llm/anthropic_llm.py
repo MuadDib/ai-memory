@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 
 from anthropic import Anthropic, APIStatusError
 
+from ai_memory.env import get_env
 from ai_memory.llm.interface import CompletionResult, LlmRateLimitError, Message
 
 logger = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ class AnthropicLlm:
         max_retries: int = 5,
         backoff_seconds: float = 2.0,
     ) -> None:
-        api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        api_key = api_key or get_env("ANTHROPIC_API_KEY")
         if not api_key:
             raise RuntimeError(
                 "Anthropic API key not set. Provide one via the ANTHROPIC_API_KEY "
