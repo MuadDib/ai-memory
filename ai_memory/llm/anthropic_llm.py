@@ -7,7 +7,7 @@ import time
 from anthropic import Anthropic, APIStatusError
 
 from ai_memory.env import get_env
-from ai_memory.llm.interface import CompletionResult, LlmRateLimitError, Message
+from ai_memory.llm.interface import CompletionResult, LlmQuotaError, LlmRateLimitError, Message
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,9 @@ class AnthropicLlm:
                 break
             except APIStatusError as exc:
                 status = getattr(exc, "status_code", None)
+                # Anthropic reports an empty balance as a 400 invalid_request_error.
+                if "credit balance is too low" in str(exc).lower():
+                    raise LlmQuotaError(f"Anthropic account out of credit: {exc}") from exc
                 # 429 (rate limit) and 529 (overloaded) are transient — back off.
                 if status in (429, 529) and attempt < self._max_retries:
                     delay = _retry_after_seconds(exc) or (

@@ -106,7 +106,19 @@ class RecallConfig:
     deep_k: int = 20
     vector_candidates: int = 50
     bm25_candidates: int = 50
+
+    # Recency multiplier at merge time (ADR-0016):
+    #   boost = floor + (1 - floor) * 0.5 ** (age_days / recency_half_life_days)
+    # A true half-life, bounded below by a per-tier floor. RRF scores only span
+    # ~3.6x across the candidate pool, so an unbounded decay (the old
+    # exp(-age/90)) swamped relevance once the core facts were a few months old
+    # and the eval fell to 4/27. Notes get a high floor — recency is a
+    # tie-breaker between comparably relevant facts, not a ranking signal (a
+    # changed fact is the job of supersession). Episodes are time-bound events,
+    # so they keep the full decay.
     recency_half_life_days: int = 90
+    note_recency_floor: float = 0.95
+    episode_recency_floor: float = 0.0
 
     # Relevance floor for vector neighbours. With text-embedding-3-small,
     # observed L2 distances on this corpus run roughly:

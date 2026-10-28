@@ -1,10 +1,11 @@
-"""Measure recall@k across recall-config variants (#1 rerank, #2 HyDE, #3 conviction).
+"""Measure recall@k across recall-config variants (#1 rerank, #2 HyDE, #3 conviction,
+ADR-0016 note recency floor).
 
 Runs the default eval suite against the live corpus under each variant and prints a
 pass-rate table, so the opt-in knobs can be validated/tuned with data before being
 enabled by default. The rerank/HyDE variants make one extra LLM call per query.
 
-Usage: python scripts/eval_recall_variants.py
+Usage: python scripts/eval_recall_variants.py [--recency-only]
 """
 from __future__ import annotations
 
@@ -41,6 +42,11 @@ def main() -> int:
         return replace(base, recall=replace(base.recall, **kw))
 
     print(f"suite: {suite.suite} ({len(suite.cases)} cases)\n")
+    # ADR-0016: how much may age discount a note? 0 = plain half-life decay, 1 = none.
+    for floor in (0.0, 0.9, 0.95, 1.0):
+        _run(f"note_recency_floor={floor}", variant(note_recency_floor=floor), suite)
+    if "--recency-only" in sys.argv:
+        return 0
     _run("baseline (conviction on)", variant(), suite)
     _run("+ rerank (#1)", variant(rerank_enabled=True), suite)
     _run("+ hyde (#2)", variant(hyde_enabled=True), suite)

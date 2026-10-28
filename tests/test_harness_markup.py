@@ -4,7 +4,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from ai_memory.core.dreaming import _render_transcript
-from ai_memory.harness_markup import TITLE_MAX_CHARS, strip_injected, title_candidate
+from ai_memory.harness_markup import (
+    TITLE_MAX_CHARS,
+    is_scheduled_task_run,
+    strip_injected,
+    title_candidate,
+)
 
 REMINDER = (
     "<system-reminder>\nContents of CLAUDE.md:\n# Global\n- be direct\n"
@@ -116,3 +121,23 @@ def test_render_strips_user_reminders_but_not_assistant_text() -> None:
         "<conversation_transcript>", "<turn n=1 role=user>", "hi", "</turn>",
     ]
     assert rendered.count("<system-reminder>") == 1  # the assistant's quote survives
+
+
+# --- is_scheduled_task_run ----------------------------------------------------
+
+
+def test_scheduled_task_tag_matches() -> None:
+    assert is_scheduled_task_run('<scheduled-task name="x" file="y">\nThis is an automated run')
+
+
+def test_scheduled_task_plain_prompt_matches() -> None:
+    assert is_scheduled_task_run("This is an automated run of a scheduled task. The user is away.")
+
+
+def test_scheduled_task_after_leading_reminder_matches() -> None:
+    text = "<system-reminder>\nscratch workspace\n</system-reminder>\n\n<scheduled-task name=\"x\">"
+    assert is_scheduled_task_run(text)
+
+
+def test_scheduled_task_mentioned_mid_turn_does_not_match() -> None:
+    assert not is_scheduled_task_run("why did <scheduled-task name=\"x\"> fail last night?")

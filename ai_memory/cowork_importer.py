@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ai_memory.core.models import CoworkImportState, Episode, Turn
-from ai_memory.harness_markup import strip_injected, title_candidate
+from ai_memory.harness_markup import is_scheduled_task_run, strip_injected, title_candidate
 from ai_memory.timestamps import now_iso, unix_to_iso
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,7 @@ class CoworkImportResult:
     sessions_extended: int           # already existed; we appended new turns
     sessions_skipped_unchanged: int  # already existed and no new turns to import
     turns_inserted: int
+    sessions_skipped_automated: int = 0  # scheduled-task runs — never imported or extended
 
 
 def import_cowork_sessions(
@@ -73,12 +74,22 @@ def import_cowork_sessions(
     imported_new = 0
     extended = 0
     skipped_unchanged = 0
+    skipped_automated = 0
     turns_total = 0
 
     for jsonl_path in _iter_session_files(root):
         seen += 1
         session_id = jsonl_path.stem
         if only_session_id and session_id != only_session_id:
+            continue
+
+        # Unattended scheduled-task runs aren't the user's conversations;
+        # dreaming them fed the task's own instructions back in as "facts".
+        # Checked every run (cheap: reads up to the first user turn) so a run
+        # imported before this rule also stops being extended.
+        first_user = _first_user_text(jsonl_path, include_tools=include_tools)
+        if first_user is not None and is_scheduled_task_run(first_user):
+            skipped_automated += 1
             continue
 
         existing_state = service.store.get_cowork_import_state(session_id)
@@ -118,10 +129,29 @@ def import_cowork_sessions(
         sessions_extended=extended,
         sessions_skipped_unchanged=skipped_unchanged,
         turns_inserted=turns_total,
+        sessions_skipped_automated=skipped_automated,
     )
 
 
 # --- Internals --------------------------------------------------------------
+
+
+def _first_user_text(jsonl_path: Path, *, include_tools: bool, max_lines: int = 50) -> str | None:
+    """Text of the session's first user turn (boilerplate stripped), or None if
+    none appears in the first `max_lines` lines."""
+    with jsonl_path.open("rb") as fh:
+        for _ in range(max_lines):
+            raw = fh.readline()
+            if not raw:
+                return None
+            try:
+                obj = json.loads(raw)
+            except ValueError:
+                continue
+            turn = _coerce_turn(obj, include_tools=include_tools, jsonl_stem=jsonl_path.stem)
+            if turn is not None and turn["role"] == "user":
+                return turn["text"]
+    return None
 
 
 def _iter_session_files(root: Path) -> Iterable[Path]:

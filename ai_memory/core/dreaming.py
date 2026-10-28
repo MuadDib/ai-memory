@@ -38,8 +38,8 @@ from pydantic import BaseModel, ValidationError
 from ai_memory.config import DreamConfig
 from ai_memory.core.models import DreamLog, Note, Profile
 from ai_memory.embeddings.interface import Embedder
-from ai_memory.harness_markup import strip_injected
-from ai_memory.llm.interface import CompletionResult, Llm, Message
+from ai_memory.harness_markup import is_scheduled_task_run, strip_injected
+from ai_memory.llm.interface import CompletionResult, Llm, LlmQuotaError, Message
 from ai_memory.storage.raw_files import RawTranscriptStore
 from ai_memory.timestamps import iso_to_dt, now_iso
 
@@ -469,6 +469,15 @@ def dream(
         # of the backlog. A failed episode is journalled and left pending
         # (consolidated_at stays NULL) so a later pass retries it.
         try:
+            # Scheduled-task runs imported before the importer started skipping
+            # them (ADR-0017): close them out with no extraction. Non-destructive
+            # — turns are kept and `redream --episode` undoes it.
+            if _is_scheduled_task_episode(raw, turns):
+                ep.consolidated_at = now
+                store.update_episode(ep)
+                journal.append(f"  Episode {ep.id}: scheduled-task run — skipped extraction.")
+                continue
+
             transcript = _render_transcript(raw, turns)
 
             # Select model: upgrade to quality_llm for long/dense episodes where
@@ -602,6 +611,8 @@ def dream(
                     "    note: 0 candidate facts extracted — "
                     "short episode, parse failure (see logs), or all facts deduplicated"
                 )
+        except LlmQuotaError:
+            raise  # account out of credit: every later episode would fail too
         except Exception as exc:  # isolate the failure to this episode
             episodes_failed += 1
             logger.exception("Episode %s failed in Phase 3: %s", ep.id, exc)
@@ -640,14 +651,21 @@ def dream(
         tokens_used += phase4b_tokens
 
     # --- Phase 5: promote recurring patterns ---------------------------
-    promoted, phase5_tokens = _phase5_promote(
-        store=store,
-        llm=llm,
-        config=config,
-        now=now,
-        journal=journal,
-        quality_llm=quality_llm,
-    )
+    # Clustering is O(n^2) over every valid note (~17-20 min at 6.7k notes).
+    # With no new notes the clusters are the same ones the last pass already
+    # judged, so skip it.
+    if notes_added == 0:
+        promoted, phase5_tokens = 0, 0
+        journal.append("Phase 5: skipped — no new notes this pass.")
+    else:
+        promoted, phase5_tokens = _phase5_promote(
+            store=store,
+            llm=llm,
+            config=config,
+            now=now,
+            journal=journal,
+            quality_llm=quality_llm,
+        )
     tokens_used += phase5_tokens
 
     # --- Phase 6: decay and prune --------------------------------------
@@ -1225,6 +1243,15 @@ def _phase6_prune(
 
 
 # --- Helpers ----------------------------------------------------------------
+
+
+def _is_scheduled_task_episode(raw: RawTranscriptStore, turns: List) -> bool:
+    """True when the episode's first user turn is a scheduled-task launch prompt."""
+    first_user = next((t for t in turns if t.role == "user"), None)
+    if first_user is None:
+        return False
+    payload = raw.read_turn(first_user.raw_file, first_user.byte_offset, first_user.byte_length)
+    return is_scheduled_task_run(payload.get("text", ""))
 
 
 def _chunk_turns(

@@ -6,7 +6,7 @@ This file is the entry point when Claude Code starts work in this repo. Read it 
 
 A local-first shared AI memory backend with an MCP server interface. One persistent SQLite-backed memory that any MCP-aware AI client (Claude Desktop, Cursor, Cline, Continue, Zed, Claude Code itself) can read and write. Four-tier model — profile / atomic notes / episode summaries / verbatim turns — with a sleep-style "dream" consolidation cycle that turns raw conversation turns into structured memory overnight.
 
-Stack: Python 3.12 with portability discipline so a future C# port is translation, not redesign. SQLite + sqlite-vec for vector search, FTS5 for BM25, fused via Reciprocal Rank Fusion (k=60). Recent-boosted at merge time. OpenAI for embeddings (`text-embedding-3-small`, 1536 dim) and LLM (`gpt-4o-mini` for cheap dream cycles).
+Stack: Python 3.12 with portability discipline so a future C# port is translation, not redesign. SQLite + sqlite-vec for vector search, FTS5 for BM25, fused via Reciprocal Rank Fusion (k=60). Bounded recency boost at merge time (ADR-0016). OpenAI for embeddings (`text-embedding-3-small`, 1536 dim) and LLM (`gpt-4o-mini` for cheap dream cycles).
 
 ## Where things live
 
@@ -25,15 +25,15 @@ Repo layout under `ai-memory/`:
 - `ai_memory/cowork_importer.py` — Walks `.claude/projects/*/*.jsonl`. Incremental via the `cowork_import_state` table (`last_turn_id` + `last_byte_offset` per session). Re-runnable; extends episodes that grew and re-marks `consolidated_at = NULL` so dream picks up the delta.
 - `tests/` — `test_recall.py`, `test_dreaming.py`, `test_storage_sqlite.py`, `test_privacy.py`, `test_cowork_importer.py`. Pure-function tests where possible; SQLite tests use temp DBs.
 
-Runtime data lives at `%LOCALAPPDATA%\ai-memory\` (`memory.db`, `profile.md`, `raw/YYYY/MM/<episode>.jsonl`, `exports/`, `logs/`, `config.yaml`). Override via `AI_MEMORY_HOME`.
+Runtime data lives at `C:\ai-mem\data\` (`memory.db`, `profile.md`, `raw/YYYY/MM/<episode>.jsonl`, `exports/`, `logs/`, `config.yaml`), set via `AI_MEMORY_HOME` in the hooks and MCP config. It is outside AppData because the Claude desktop app is MSIX-packaged and redirects new AppData folders. The code default is still `%LOCALAPPDATA%\ai-memory\` (legacy). Back up with `scripts/backup_db.ps1`, which is WAL-safe; a plain file copy of `memory.db` misses the WAL.
 
 ## Read these before changing anything significant
 
 - **`../shared-ai-memory-proposal.md`** — the canonical design doc. Versioned via changelog blocks at the top. v4 (2026-04-27 afternoon) covers the recall-quality debug arc and the open follow-ups; v3 covers the build session; v2 covers the pre-build design with research synthesis from six existing-memory-MCP deep-dives.
 - **`README.md`** — install/wiring instructions and the current command surface.
 - **`docs/porting-to-csharp.md`** — the portability discipline that shapes module boundaries. Honour it when adding new code; if you cross it, justify it in the PR or in the proposal doc.
-- **`docs/decisions/`** — ADRs (one decision per file). Latest: **[ADR-0015 — Strip Harness-Injected Markup from User Turns](docs/decisions/0015-strip-harness-injected-markup.md)**.
-- **`docs/reviews/`** — point-in-time health audits of the live corpus. Latest: **[2026-06-07 Memory Health Review](docs/reviews/2026-06-07-memory-health-review.md)**.
+- **`docs/decisions/`** — ADRs (one decision per file). Latest: **[ADR-0016 — Bounded Recency Boost and BM25 Stopwords](docs/decisions/0016-bounded-recency-and-bm25-stopwords.md)** and **[ADR-0017 — Exclude Scheduled-Task Runs](docs/decisions/0017-exclude-scheduled-task-runs.md)**.
+- **`docs/reviews/`** — point-in-time health audits of the live corpus. Latest committed: **[2026-06-07 Memory Health Review](docs/reviews/2026-06-07-memory-health-review.md)**. Weekly audits quote personal corpus content, so they live in `docs/reviews/private/`, which is gitignored and local-only (this repo is public). Latest: `docs/reviews/private/2026-10-28-weekly-health.md`.
 - **`docs/plans/`** — actionable remediation/work plans. Active: **[Dream-Cycle Deadlock Remediation](docs/plans/2026-06-07-dream-deadlock-remediation.md)**.
 
 ## Stable contracts (don't change without eval data)
@@ -62,6 +62,7 @@ These are listed in proposal v3 + v4:
 > the [health review](docs/reviews/2026-06-07-memory-health-review.md), and the
 > [remediation plan](docs/plans/2026-06-07-dream-deadlock-remediation.md).
 
+0. **Phase 6 prune cliff (deadline ~2027-01-21).** Prune scores notes as `exp(-age/90d) × (1 + ln(1 + access_count))` against 0.05. Recall never bumps `access_count` (only dedup hits do), so any note with `access_count = 0` is soft-deleted at about 270 days. That's 5,495 of 6,705 valid notes, starting with the 533 April bootstrap facts around 2027-01-21. Decide the fix (count recall hits, apply an ADR-0016-style floor, or require low quality as well as low age) before then.
 1. **Pre-render redaction** — privacy filter runs before persistence, but the assembled transcript still has raw creds when sent to OpenAI for dream cycles.
 2. **Phase 4 contradiction detection** — `invalidated` count is low; the mid-band LLM verdict prompt needs more signal for genuine contradictions. Needs eval cases.
 3. **`ai-memory redream --all` with confirmation gate** — current `--all-pending` re-dreams unconsolidated episodes; a separate `--all` that resets ALL episodes is missing.

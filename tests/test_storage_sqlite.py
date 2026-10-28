@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from ai_memory.core.models import Episode, Note, Profile
-from ai_memory.storage.sqlite_store import SqliteStore
+from ai_memory.storage.sqlite_store import SqliteStore, _fts5_escape
 from ai_memory.timestamps import now_iso
 
 
@@ -99,6 +99,27 @@ def test_bm25_search(store: SqliteStore) -> None:
     ids = [h[0].id for h in hits]
     assert "a" in ids and "c" in ids
     assert "b" not in ids
+
+
+def test_fts5_escape_drops_function_words() -> None:
+    assert _fts5_escape("what is the embedding model") == '"embedding" OR "model"'
+    assert _fts5_escape("Where IS the") == ""
+
+
+def test_bm25_search_ignores_notes_sharing_only_function_words(store: SqliteStore) -> None:
+    """ADR-0016: under OR, filler words ("the" is in ~70% of live notes) padded
+    the BM25 candidate list with notes that share nothing but grammar."""
+    now = now_iso()
+    for nid, text in [
+        ("filler", "The cat is on the mat and the dog is in the garden."),
+        ("answer", "Igor lives in London."),
+    ]:
+        store.insert_note(
+            Note(id=nid, text=text, valid_from=now, ingested_at=now, embedding_model="t"),
+            [0.0, 0.0, 0.0, 0.0],
+        )
+    ids = [h[0].id for h in store.search_notes_bm25("where is the London office", k=5)]
+    assert ids == ["answer"]
 
 
 def test_bm25_search_natural_language_query_matches_on_shared_terms(store: SqliteStore) -> None:
