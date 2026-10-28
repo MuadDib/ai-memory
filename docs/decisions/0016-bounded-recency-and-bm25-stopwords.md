@@ -74,5 +74,5 @@ Measured on the live corpus (27 cases; pass = expected text in the top k):
 - **Margins are thin.** Several cases pass at rank 5–8 of k=8. Top hits are
   often transient notes ("Igor is using a scratch workspace for this
   session"), so extraction quality is now the main recall lever.
-- **Phase 6 prune still uses `exp(-age / decay_half_life_days)`.** It is out of
-  scope here; see the open follow-up on the prune cliff.
+- **Phase 6 prune used the same unbounded decay.** It is now off by default;
+  see ADR-0018.
