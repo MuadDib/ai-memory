@@ -267,6 +267,45 @@ def test_phase5_skipped_when_pass_adds_no_notes(wiring) -> None:
     assert "Phase 5: skipped" in report.journal
 
 
+def _insert_aged_note(store, embedder, text: str, ingested_at: str) -> str:
+    note = Note(
+        id=new_id(), text=text, tags=["preference"], source_episode_ids=["epA"],
+        valid_from=ingested_at, ingested_at=ingested_at, embedding_model=embedder.model_id,
+    )
+    store.insert_note(note, embedder.embed([text])[0])
+    return note.id
+
+
+def test_phase6_prune_is_off_by_default(wiring) -> None:
+    """ADR-0018: a year-old, never-deduplicated fact is the normal case for a
+    durable fact, not evidence it's stale. The old rule deleted it at ~270 days."""
+    store, _raw, embedder = wiring
+    _insert_aged_note(store, embedder, "Igor prefers PostgreSQL", "2025-10-01T00:00:00Z")
+    journal: list[str] = []
+
+    pruned = dreaming._phase6_prune(
+        store=store, config=DreamConfig(), now="2026-10-28T00:00:00Z", journal=journal
+    )
+
+    assert pruned == 0
+    assert len(store.list_valid_notes()) == 1
+    assert journal == ["Phase 6: pruning disabled (ADR-0018)."]
+
+
+def test_phase6_prune_still_works_when_enabled(wiring) -> None:
+    store, _raw, embedder = wiring
+    _insert_aged_note(store, embedder, "Igor prefers PostgreSQL", "2025-10-01T00:00:00Z")
+    young = _insert_aged_note(store, embedder, "Igor uses Python", "2026-10-01T00:00:00Z")
+
+    pruned = dreaming._phase6_prune(
+        store=store, config=DreamConfig(prune_enabled=True),
+        now="2026-10-28T00:00:00Z", journal=[],
+    )
+
+    assert pruned == 1
+    assert {n.id for n in store.list_valid_notes()} == {young}  # `old` soft-deleted
+
+
 def test_dream_respects_max_episodes_cap(wiring) -> None:
     store, raw, embedder = wiring
     # Three separate episodes (distinct sources).

@@ -71,6 +71,10 @@ class DreamConfig:
     promotion_min_episodes: int = 2
     decay_half_life_days: int = 90
     prune_threshold: float = 0.05
+    # Phase 6 age-based pruning, off by default (ADR-0018). Age isn't evidence
+    # that a fact is stale: with recall never bumping access_count, the rule
+    # would have soft-deleted nearly every note 9-12 months after it was learned.
+    prune_enabled: bool = False
     # Turn count at or above which the quality_model is used for Phase 3
     # extraction on that episode.  0 = never upgrade.
     long_episode_turns: int = 100

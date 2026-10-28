@@ -8,7 +8,7 @@ This is the heavy LLM pipeline that turns raw turns into clean memory:
     Phase 3 — CONSOLIDATE (LLM summarises episodes, extracts atomic facts)
     Phase 4 — INTEGRATE  (dedupe via vector + LLM, contradict-resolution, link)
     Phase 5 — PROMOTE    (recurring patterns -> profile)
-    Phase 6 — DECAY/PRUNE (soft-delete stale notes)
+    Phase 6 — DECAY/PRUNE (soft-delete stale notes; off by default, ADR-0018)
     Phase 7 — JOURNAL    (write dream_log entry)
 
 Cost discipline: Phase 4 is where LLM cost can balloon. We bracket it tightly:
@@ -1215,7 +1215,14 @@ def _sanitise_profile_key(key: str) -> str:
 def _phase6_prune(
     *, store: "MemoryStore", config: DreamConfig, now: str, journal: List[str]
 ) -> int:
-    """Soft-delete stale, never-recalled, never-promoted notes."""
+    """Soft-delete old, never-promoted notes that were never re-corroborated.
+
+    `access_count` only counts dedup/consolidation hits (recall doesn't bump
+    it), so this is an age rule in practice. Off unless `prune_enabled`.
+    """
+    if not config.prune_enabled:
+        journal.append("Phase 6: pruning disabled (ADR-0018).")
+        return 0
     half_life = max(1, config.decay_half_life_days) * 86400
     pruned = 0
     now_dt = iso_to_dt(now)

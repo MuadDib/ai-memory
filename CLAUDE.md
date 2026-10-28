@@ -32,7 +32,7 @@ Runtime data lives at `C:\ai-mem\data\` (`memory.db`, `profile.md`, `raw/YYYY/MM
 - **`../shared-ai-memory-proposal.md`** — the canonical design doc. Versioned via changelog blocks at the top. v4 (2026-04-27 afternoon) covers the recall-quality debug arc and the open follow-ups; v3 covers the build session; v2 covers the pre-build design with research synthesis from six existing-memory-MCP deep-dives.
 - **`README.md`** — install/wiring instructions and the current command surface.
 - **`docs/porting-to-csharp.md`** — the portability discipline that shapes module boundaries. Honour it when adding new code; if you cross it, justify it in the PR or in the proposal doc.
-- **`docs/decisions/`** — ADRs (one decision per file). Latest: **[ADR-0016 — Bounded Recency Boost and BM25 Stopwords](docs/decisions/0016-bounded-recency-and-bm25-stopwords.md)** and **[ADR-0017 — Exclude Scheduled-Task Runs](docs/decisions/0017-exclude-scheduled-task-runs.md)**.
+- **`docs/decisions/`** — ADRs (one decision per file). Latest: **[ADR-0016 — Bounded Recency Boost and BM25 Stopwords](docs/decisions/0016-bounded-recency-and-bm25-stopwords.md)**, **[ADR-0017 — Exclude Scheduled-Task Runs](docs/decisions/0017-exclude-scheduled-task-runs.md)** and **[ADR-0018 — Disable Age-Based Pruning](docs/decisions/0018-disable-age-based-pruning.md)**.
 - **`docs/reviews/`** — point-in-time health audits of the live corpus. Latest committed: **[2026-06-07 Memory Health Review](docs/reviews/2026-06-07-memory-health-review.md)**. Weekly audits quote personal corpus content, so they live in `docs/reviews/private/`, which is gitignored and local-only (this repo is public). Latest: `docs/reviews/private/2026-10-28-weekly-health.md`.
 - **`docs/plans/`** — actionable remediation/work plans. Active: **[Dream-Cycle Deadlock Remediation](docs/plans/2026-06-07-dream-deadlock-remediation.md)**.
 
@@ -62,7 +62,7 @@ These are listed in proposal v3 + v4:
 > the [health review](docs/reviews/2026-06-07-memory-health-review.md), and the
 > [remediation plan](docs/plans/2026-06-07-dream-deadlock-remediation.md).
 
-0. **Phase 6 prune cliff (deadline ~2027-01-21).** Prune scores notes as `exp(-age/90d) × (1 + ln(1 + access_count))` against 0.05. Recall never bumps `access_count` (only dedup hits do), so any note with `access_count = 0` is soft-deleted at about 270 days. That's 5,495 of 6,705 valid notes, starting with the 533 April bootstrap facts around 2027-01-21. Decide the fix (count recall hits, apply an ADR-0016-style floor, or require low quality as well as low age) before then.
+0. **Junk sweep (optional).** Age-based pruning is off ([ADR-0018](docs/decisions/0018-disable-age-based-pruning.md)): it was about to soft-delete 87% of notes by mid-2027, regardless of quality. If stricter extraction doesn't bring the junk rate down enough, add a quality-targeted sweep instead: LLM-judged, opt-in, with a dry-run report first.
 1. **Pre-render redaction** — privacy filter runs before persistence, but the assembled transcript still has raw creds when sent to OpenAI for dream cycles.
 2. **Phase 4 contradiction detection** — `invalidated` count is low; the mid-band LLM verdict prompt needs more signal for genuine contradictions. Needs eval cases.
 3. **`ai-memory redream --all` with confirmation gate** — current `--all-pending` re-dreams unconsolidated episodes; a separate `--all` that resets ALL episodes is missing.
