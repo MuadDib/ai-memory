@@ -20,7 +20,7 @@ import time
 from openai import APIStatusError, OpenAI
 
 from ai_memory.env import get_env
-from ai_memory.llm.interface import CompletionResult, LlmRateLimitError, Message
+from ai_memory.llm.interface import CompletionResult, LlmQuotaError, LlmRateLimitError, Message
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,12 @@ class OpenAILlm:
                 status = getattr(exc, "status_code", None)
                 body = _response_body(exc)
                 if status == 429:
+                    if _is_quota_exhausted(body):
+                        # Out of credit also arrives as a 429; retrying only
+                        # made it look like throttling in the logs (2026-10-20).
+                        raise LlmQuotaError(
+                            f"OpenAI account out of credit/quota (model {self._model}): {body}"
+                        ) from exc
                     permanent = _is_permanent_rate_limit(body)
                     if permanent:
                         # Reshaping is the only way out — never retry as-is.
@@ -124,6 +130,14 @@ def _response_body(exc: APIStatusError) -> str:
         return exc.response.text  # type: ignore[union-attr]
     except Exception:
         return str(exc)
+
+
+_QUOTA_CODES = ("insufficient_quota", "credit_balance_exhausted")
+
+
+def _is_quota_exhausted(body: str) -> bool:
+    """True when a 429 means the account is out of credit, not throttled."""
+    return any(code in body for code in _QUOTA_CODES)
 
 
 def _is_permanent_rate_limit(body: str) -> bool:

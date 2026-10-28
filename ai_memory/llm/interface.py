@@ -43,6 +43,15 @@ class LlmRateLimitError(LlmError):
         self.retry_after = retry_after
 
 
+class LlmQuotaError(LlmError):
+    """The provider account is out of credit or quota.
+
+    Not retryable: no request succeeds until someone tops the account up, so
+    adapters raise it at once instead of backing off, and the daemon pauses
+    dreaming for hours rather than re-firing passes.
+    """
+
+
 @dataclass(frozen=True)
 class CompletionResult:
     text: str

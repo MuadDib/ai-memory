@@ -208,6 +208,65 @@ def test_phase5_declines_external_entity_cluster(wiring) -> None:
     assert "current_company" not in profile
 
 
+def test_quota_error_aborts_the_pass_and_leaves_episodes_pending(wiring) -> None:
+    from ai_memory.llm.interface import LlmQuotaError
+
+    store, raw, embedder = wiring
+    for i in range(2):
+        remember(store=store, raw=raw, text=f"fact {i} about Igor", source=f"src{i}")
+    llm = _FakeLlm(fail_marker=None)
+    llm.complete = lambda *a, **k: (_ for _ in ()).throw(LlmQuotaError("out of credit"))
+
+    with pytest.raises(LlmQuotaError):
+        dreaming.dream(
+            store=store, raw=raw, embedder=embedder, llm=llm, quality_llm=None,
+            config=DreamConfig(max_request_tokens=100000, long_episode_turns=0),
+            request=DreamRequest(trigger="manual"),
+        )
+    pending = [e for e in store.episodes_since("1970-01-01T00:00:00Z") if e.consolidated_at is None]
+    assert len(pending) == 2
+
+
+def test_scheduled_task_episode_is_closed_without_extraction(wiring) -> None:
+    store, raw, embedder = wiring
+    remember(
+        store=store, raw=raw, source="audit",
+        text='<scheduled-task name="weekly-ai-memory-health" file="SKILL.md">\n'
+             "This is an automated run of a scheduled task.\n</scheduled-task>",
+    )
+    llm = _FakeLlm(fail_marker=None)
+
+    report = dreaming.dream(
+        store=store, raw=raw, embedder=embedder, llm=llm, quality_llm=None,
+        config=DreamConfig(max_request_tokens=100000, long_episode_turns=0),
+        request=DreamRequest(trigger="manual"),
+    )
+
+    assert llm.calls == 0 and report.notes_added == 0
+    [episode] = store.episodes_since("1970-01-01T00:00:00Z")
+    assert episode.consolidated_at is not None  # no longer pending
+    assert "scheduled-task run" in report.journal
+
+
+def test_phase5_skipped_when_pass_adds_no_notes(wiring) -> None:
+    store, raw, embedder = wiring
+    # A cluster that WOULD be promoted if Phase 5 ran.
+    _insert_cluster(
+        store, embedder,
+        ["Igor prefers PostgreSQL", "Igor likes Postgres", "Igor's database is PostgreSQL"],
+        [["epA"], ["epB"], ["epA"]],
+    )
+    promo = _PromoLlm('{"key": "preferred_database", "value": "PostgreSQL", "rationale": "x"}')
+
+    report = dreaming.dream(
+        store=store, raw=raw, embedder=embedder, llm=promo, quality_llm=promo,
+        config=DreamConfig(), request=DreamRequest(trigger="idle"),
+    )
+
+    assert promo.calls == 0 and report.notes_promoted_to_profile == 0
+    assert "Phase 5: skipped" in report.journal
+
+
 def test_dream_respects_max_episodes_cap(wiring) -> None:
     store, raw, embedder = wiring
     # Three separate episodes (distinct sources).

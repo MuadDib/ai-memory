@@ -21,6 +21,10 @@ build/
 dist/
 
 # Local memory data (never commit user content)
+# Weekly audits quote the live corpus; this repo is public. The second pattern
+# catches an audit written to the old location.
+docs/reviews/private/
+docs/reviews/*-weekly-health.md
 memory.db
 memory.db-*
 profile.md

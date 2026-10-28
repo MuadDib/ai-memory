@@ -256,6 +256,52 @@ def test_import_stores_clean_text_and_title(service, tmp_path: Path) -> None:
     assert texts == ["let's fix ai-memory", "on it"]
 
 
+_SCHEDULED = (
+    '<scheduled-task name="weekly-ai-memory-health" file="C:\\tasks\\SKILL.md">\n'
+    "This is an automated run of a scheduled task. The user is not present.\n"
+    "</scheduled-task>"
+)
+
+
+def test_import_skips_scheduled_task_runs(service, tmp_path: Path) -> None:
+    root = tmp_path / "projects"
+    _write_session(root / "proj" / "audit.jsonl", [
+        _line("u1", "user", _SCHEDULED),
+        _line("a1", "assistant", [{"type": "text", "text": "running the audit"}]),
+    ])
+    # The app puts a reminder ahead of the task prompt in some sessions.
+    _write_session(root / "proj" / "watch.jsonl", [
+        _line("u1", "user", f"{_REMINDER}\n\n{_SCHEDULED}"),
+    ])
+    # Discussing scheduled tasks later in a normal session must not match.
+    _write_session(root / "proj" / "chat.jsonl", [
+        _line("u1", "user", "why did my audit fail?"),
+        _line("u2", "user", f"it started with {_SCHEDULED}"),
+    ])
+
+    result = import_cowork_sessions(service=service, root=root)
+
+    assert result.sessions_skipped_automated == 2
+    assert result.sessions_imported_new == 1
+    assert service.store.get_episode("audit") is None
+    assert service.store.get_episode("watch") is None
+    assert service.store.get_episode("chat") is not None
+
+
+def test_import_stops_extending_a_previously_imported_scheduled_run(service, tmp_path: Path) -> None:
+    root = tmp_path / "projects"
+    path = _write_session(root / "proj" / "audit.jsonl", [_line("u1", "user", "placeholder")])
+    import_cowork_sessions(service=service, root=root)  # imported under the old rule
+    _write_session(path, [
+        _line("u1", "user", _SCHEDULED),
+        _line("a1", "assistant", [{"type": "text", "text": "more audit output"}]),
+    ])
+
+    result = import_cowork_sessions(service=service, root=root)
+
+    assert result.sessions_skipped_automated == 1 and result.turns_inserted == 0
+
+
 def test_linear_scan_resumes_past_reminder_only_watermark(service, tmp_path: Path) -> None:
     # State written by the pre-ADR-0015 importer, whose watermark is a turn that
     # now strips to nothing. Force the linear-scan path (offset past EOF).

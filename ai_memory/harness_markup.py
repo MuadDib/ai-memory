@@ -68,6 +68,21 @@ def strip_injected(text: str) -> str:
     return _EXCESS_BLANK_LINES_RE.sub("\n\n", cleaned).strip()
 
 
+_SCHEDULED_TASK_PREFIXES = ("<scheduled-task", "This is an automated run of a scheduled task")
+
+
+def is_scheduled_task_run(first_user_text: str) -> bool:
+    """True when a session's FIRST user turn is a scheduled-task launch prompt.
+
+    These runs are unattended and repeat: the prompt is the task file and the
+    replies are point-in-time results, so dreaming them turned the task's
+    instructions into "facts about the user" (2026-10 health reviews). Anchored
+    at the start, after boilerplate, so a session that merely discusses
+    scheduled tasks never matches.
+    """
+    return strip_injected(first_user_text).lstrip().startswith(_SCHEDULED_TASK_PREFIXES)
+
+
 def title_candidate(text: str) -> str | None:
     """Return a short title from a user turn, or None if it has no own words.
 

@@ -231,12 +231,31 @@ def _fts5_escape(query: str) -> str:
     appear in the note — including stopwords no note would ever contain —
     so BM25 silently returned zero candidates for nearly every recall query,
     leaving vector search as the sole ranker and BM25 as dead weight.
+
+    English function words are dropped (ADR-0016). Under OR they're not
+    harmless: "the" is in ~70% of notes, so a question's filler words filled the
+    50-candidate BM25 list with notes that share nothing but grammar, and RRF
+    weights that list by rank, not by how weak the match was.
     """
     import re
-    tokens = re.findall(r"\w+", query, flags=re.UNICODE)
+    tokens = [
+        t for t in re.findall(r"\w+", query, flags=re.UNICODE)
+        if t.lower() not in _FTS_STOPWORDS
+    ]
     if not tokens:
         return ""
     return " OR ".join(f'"{t}"' for t in tokens)
+
+
+# Function words only — never content words, which BM25's IDF already weighs.
+_FTS_STOPWORDS = frozenset(
+    "a an the and or but nor of to in on at by for from with as into onto about "
+    "is are was were be been being am do does did done has have had having "
+    "can could will would shall should may might must "
+    "i me my mine we us our you your he him his she her it its they them their "
+    "this that these those there here what which who whom whose when where why how "
+    "not no so if than then too very also just any some all each".split()
+)
 
 
 def _pack_vec(vec: list[float]) -> bytes:

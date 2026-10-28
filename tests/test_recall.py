@@ -3,11 +3,17 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from ai_memory.core.models import RecallHit
+import pytest
+
+from ai_memory.config import RecallConfig
+from ai_memory.core.models import Note, RecallHit
 from ai_memory.core.recall import (
+    RecallRequest,
     _conviction_boost,
     _hyde_embedding,
     _llm_rerank,
+    _recency_boost,
+    recall,
     reciprocal_rank_fusion,
 )
 from ai_memory.llm.interface import CompletionResult
@@ -118,6 +124,76 @@ def test_conviction_boost_is_gentle_log_scaled() -> None:
     # A heavily-corroborated note gets a bounded nudge, not a runaway multiplier.
     big = _conviction_boost(access_count=100, source_episodes=100, weight=0.2)
     assert 1.0 < big < 2.2
+
+
+# --- Recency boost (ADR-0016) -------------------------------------------------
+
+DAY = 86400
+NOW = "2026-10-28T00:00:00Z"
+
+
+def test_recency_boost_is_a_true_half_life() -> None:
+    assert _recency_boost(age_seconds=0, half_life_days=90, floor=0.0) == 1.0
+    assert _recency_boost(age_seconds=90 * DAY, half_life_days=90, floor=0.0) == pytest.approx(0.5)
+
+
+def test_recency_boost_never_drops_below_floor() -> None:
+    ancient = _recency_boost(age_seconds=10_000 * DAY, half_life_days=90, floor=0.95)
+    assert 0.95 <= ancient < 0.951
+    one_half_life = _recency_boost(age_seconds=90 * DAY, half_life_days=90, floor=0.95)
+    assert one_half_life == pytest.approx(0.975)
+
+
+def test_recency_boost_floor_one_disables_decay() -> None:
+    assert _recency_boost(age_seconds=365 * DAY, half_life_days=90, floor=1.0) == 1.0
+
+
+def test_recency_boost_treats_future_anchor_as_new() -> None:
+    assert _recency_boost(age_seconds=-5 * DAY, half_life_days=90, floor=0.0) == 1.0
+
+
+def _note(id_: str, ingested_at: str) -> Note:
+    return Note(
+        id=id_, text=id_, valid_from=ingested_at, ingested_at=ingested_at,
+        source_episode_ids=["ep"], embedding_model="t",
+    )
+
+
+def _recall_ids(
+    *, vector: list[Note], bm25: list[Note], config: RecallConfig | None = None
+) -> list[str]:
+    store = MagicMock()
+    store.search_notes_vector.return_value = [(n, 0.5) for n in vector]
+    store.search_notes_bm25.return_value = [(n, -1.0) for n in bm25]
+    store.search_episodes_vector.return_value = []
+    embedder = MagicMock()
+    embedder.embed.return_value = [[0.0]]
+    hits = recall(
+        store=store, raw=MagicMock(), embedder=embedder,
+        config=config or RecallConfig(), request=RecallRequest(query="q", k=8), now=NOW,
+    )
+    return [h.id for h in hits]
+
+
+def test_old_strong_match_beats_fresh_single_ranker_match() -> None:
+    """Regression for the 2026-10 eval collapse (4/27): a 6-month-old fact found
+    by BOTH rankers lost to a fresh note found by only one, because unbounded
+    decay outweighed RRF's whole ~3.6x score range."""
+    old = _note("old-fact", "2026-04-30T00:00:00Z")
+    fresh = _note("fresh-noise", "2026-10-27T00:00:00Z")
+    assert _recall_ids(vector=[old], bm25=[old, fresh])[0] == "old-fact"
+    # Plain half-life decay (no floor) still buries it — the floor is the fix.
+    unfloored = RecallConfig(note_recency_floor=0.0)
+    assert _recall_ids(vector=[old], bm25=[old, fresh], config=unfloored)[0] == "fresh-noise"
+
+
+def test_recency_breaks_ties_between_equally_relevant_restatements() -> None:
+    older = _note("powershell-5", "2026-04-30T00:00:00Z")
+    newer = _note("powershell-7", "2026-10-20T00:00:00Z")
+    # Mirror-image ranks: identical RRF score and conviction; only age differs.
+    assert _recall_ids(vector=[older, newer], bm25=[newer, older])[:2] == [
+        "powershell-7", "powershell-5",
+    ]
 
 
 def test_rrf_single_ranker() -> None:

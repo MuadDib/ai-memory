@@ -36,6 +36,7 @@ from pathlib import Path
 
 from ai_memory.config import Config
 from ai_memory.core.service import MemoryService
+from ai_memory.llm.interface import LlmQuotaError
 from ai_memory.process_lock import process_alive
 from ai_memory.timestamps import now_iso, unix_to_iso
 
@@ -50,6 +51,8 @@ _POLL_INTERVAL_SECONDS = 60
 # logged 50k+ failed passes when a single episode poison-pilled every attempt.
 _CIRCUIT_BREAKER_THRESHOLD = 3
 _CIRCUIT_BREAKER_COOLDOWN_SECONDS = 3600  # 1 hour
+# Out of credit doesn't clear on its own — someone has to top the account up.
+_QUOTA_COOLDOWN_SECONDS = 6 * 3600
 
 
 @dataclass
@@ -192,6 +195,23 @@ def _run_pass(
     _emit(log_path, {"event": "dream_start", "trigger": trigger, **(extra or {})})
     try:
         report = service.dream(trigger=trigger)
+    except LlmQuotaError as exc:
+        state.circuit_open_until = int(time.time()) + _QUOTA_COOLDOWN_SECONDS
+        logger.error(
+            "Dream pass (%s) stopped: LLM account out of credit/quota. Pausing "
+            "dreaming until %s — top up the account. %s",
+            trigger, unix_to_iso(state.circuit_open_until), exc,
+        )
+        _emit(
+            log_path,
+            {
+                "event": "quota_exhausted",
+                "trigger": trigger,
+                "error": str(exc)[:500],
+                "until": unix_to_iso(state.circuit_open_until),
+            },
+        )
+        return
     except Exception as exc:
         # dream() isolates per-episode failures internally, so reaching here
         # means something broke around the pass itself. Count it and let the

@@ -20,10 +20,12 @@ it does. (An earlier version scored episodes via 1/(1+distance), landing on a
 episodes mathematically bury well-corroborated notes once the corpus grew —
 see the regression test in test_recall_merge.py for the concrete scenario.)
 
-Recency boost:
-    boost(doc) = exp(- age_days / half_life_days)
+Recency boost (ADR-0016):
+    boost(doc) = floor + (1 - floor) * 0.5 ** (age_days / half_life_days)
     final     = rrf_score * boost
 
+`floor` is per tier: high for notes (recency only breaks ties between
+comparably relevant facts), zero for episodes (time-bound events decay fully).
 Recency boost is applied only at the merge stage (not inside each ranker)
 so the ranker-internal scores remain comparable.
 """
@@ -170,6 +172,14 @@ def _conviction_boost(*, access_count: int, source_episodes: int, weight: float)
     return 1.0 + weight * math.log1p(signal)
 
 
+def _recency_boost(*, age_seconds: float, half_life_days: float, floor: float) -> float:
+    """Recency multiplier in [floor, 1]: a true half-life decay bounded below by
+    `floor`. floor=1 disables decay; floor=0 is plain half-life decay."""
+    half_life_seconds = max(1.0, half_life_days * 86400)
+    decay = 0.5 ** (max(0.0, age_seconds) / half_life_seconds)
+    return floor + (1.0 - floor) * decay
+
+
 def recall(
     *,
     store: "MemoryStore",
@@ -293,13 +303,14 @@ def recall(
     notes_by_id.update({n.id: n for n, _ in bm25_hits})
     episodes_by_id = {ep.id: ep for ep, _ in episodes_filtered}
 
-    # 6. Apply recency boost uniformly (notes anchor on ingested_at, episodes on started_at).
-    half_life_seconds = max(1, config.recency_half_life_days * 86400)
+    # 6. Apply recency boost (notes anchor on ingested_at, episodes on started_at),
+    #    with a per-tier floor so age can't outweigh relevance for durable facts.
     boosted: list[tuple[str, float]] = []
     for item_id, base_score in fused.items():
         if item_id in notes_by_id:
             note = notes_by_id[item_id]
             anchor = note.ingested_at
+            floor = config.note_recency_floor
             # #3 conviction boost: corroboration (source episodes) + reinforcement
             # (access_count). Notes only; episodes have no comparable signal.
             conviction = _conviction_boost(
@@ -309,11 +320,15 @@ def recall(
             )
         elif item_id in episodes_by_id:
             anchor = episodes_by_id[item_id].started_at
+            floor = config.episode_recency_floor
             conviction = 1.0
         else:
             continue
-        age = max(0, (iso_to_dt(now) - iso_to_dt(anchor)).total_seconds())
-        boost = math.exp(-age / half_life_seconds)
+        boost = _recency_boost(
+            age_seconds=(iso_to_dt(now) - iso_to_dt(anchor)).total_seconds(),
+            half_life_days=config.recency_half_life_days,
+            floor=floor,
+        )
         boosted.append((item_id, base_score * boost * conviction))
     boosted.sort(key=lambda pair: pair[1], reverse=True)
 

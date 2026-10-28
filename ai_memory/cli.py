@@ -394,6 +394,7 @@ def import_cowork(config, root_path, include_tools, session_id):
             f"new={result.sessions_imported_new} "
             f"extended={result.sessions_extended} "
             f"unchanged={result.sessions_skipped_unchanged} "
+            f"automated={result.sessions_skipped_automated} "
             f"turns_inserted={result.turns_inserted}"
         )
     finally:
