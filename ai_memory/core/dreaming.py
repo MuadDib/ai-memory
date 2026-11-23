@@ -27,6 +27,7 @@ import json
 import logging
 import math
 import re
+import time
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import TYPE_CHECKING, Callable, Iterable, List, Literal, Tuple, TypeVar
@@ -34,6 +35,11 @@ from typing import TYPE_CHECKING, Callable, Iterable, List, Literal, Tuple, Type
 from ai_memory.ids import new_id
 
 from pydantic import BaseModel, ValidationError
+
+try:  # Optional accelerator for Phase 5 clustering (ADR-0020).
+    import numpy as _np
+except ImportError:  # pragma: no cover - exercised when numpy is absent
+    _np = None
 
 from ai_memory.config import DreamConfig
 from ai_memory.core.models import DreamLog, Note, Profile
@@ -47,6 +53,81 @@ if TYPE_CHECKING:
     from ai_memory.storage.interface import MemoryStore
 
 logger = logging.getLogger(__name__)
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def _format_progress(label: str, done: int, total: int, elapsed: float) -> str:
+    """One progress line: count, percent, elapsed and a linear ETA."""
+    if total <= 0:
+        return f"{label}: {done} done, elapsed {_format_duration(elapsed)}"
+    pct = 100.0 * done / total
+    eta = "?"
+    if 0 < done < total:
+        eta = "~" + _format_duration(elapsed * (total - done) / done)
+    elif done >= total:
+        eta = "0s"
+    return (
+        f"{label}: {done}/{total} ({pct:.1f}%), "
+        f"elapsed {_format_duration(elapsed)}, eta {eta}"
+    )
+
+
+class _Progress:
+    """Throttled INFO progress logging for long dream phases.
+
+    Logs on start, at most every `every_seconds` while stepping, and on
+    finish — so the daemon log always says how far along a pass is and
+    roughly how long is left.
+    """
+
+    def __init__(
+        self,
+        label: str,
+        total: int,
+        *,
+        every_seconds: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
+        log: logging.Logger = logger,
+    ) -> None:
+        self.label = label
+        self.total = total
+        self.done = 0
+        self._every = every_seconds
+        self._clock = clock
+        self._log = log
+        self._start = clock()
+        self._last = self._start
+        log.info("dream progress: %s started (%d items)", label, total)
+
+    def step(self, n: int = 1) -> None:
+        self.update(self.done + n)
+
+    def update(self, done: int) -> None:
+        self.done = done
+        now = self._clock()
+        if now - self._last >= self._every:
+            self._last = now
+            self._log.info(
+                "dream progress: %s",
+                _format_progress(self.label, self.done, self.total, now - self._start),
+            )
+
+    def finish(self) -> None:
+        elapsed = self._clock() - self._start
+        self._log.info(
+            "dream progress: %s finished: %d/%d in %s",
+            self.label, self.done, self.total, _format_duration(elapsed),
+        )
 
 
 # --- Tunables (kept here, not in config, since they're pipeline internals) ---
@@ -459,7 +540,9 @@ def dream(
     candidate_facts: List[_CandidateFact] = []
     episodes_consolidated = 0
     episodes_failed = 0
-    for ep in episodes:
+    phase3_progress = _Progress("Phase 3 consolidate episodes", len(episodes))
+    for ep_index, ep in enumerate(episodes):
+        phase3_progress.update(ep_index)
         turns = list(store.get_turns_for_episode(ep.id))
         if not turns:
             continue
@@ -672,6 +755,9 @@ def dream(
             )
             continue
 
+    phase3_progress.update(len(episodes))
+    phase3_progress.finish()
+
     # --- Phase 4: integrate candidate facts ----------------------------
     integrated, phase4_tokens = _phase4_integrate(
         candidates=candidate_facts,
@@ -701,7 +787,8 @@ def dream(
         tokens_used += phase4b_tokens
 
     # --- Phase 5: promote recurring patterns ---------------------------
-    # Clustering is O(n^2) over every valid note (~17-20 min at 6.7k notes).
+    # Clustering is O(n^2) over every valid note: seconds with numpy, ~2 h in
+    # pure Python at ~14k notes (ADR-0020).
     # With no new notes the clusters are the same ones the last pass already
     # judged, so skip it.
     if notes_added == 0:
@@ -805,7 +892,9 @@ def _phase4_integrate(
     # Embed all candidates in one batch — single API call instead of N.
     candidate_embeddings = embedder.embed([c.text for c in candidates])
 
-    for cand, cand_emb in zip(candidates, candidate_embeddings):
+    progress = _Progress("Phase 4 integrate candidate facts", len(candidates))
+    for cand_index, (cand, cand_emb) in enumerate(zip(candidates, candidate_embeddings)):
+        progress.update(cand_index)
         neighbours = store.search_notes_vector(
             cand_emb, k=INTEGRATE_NEIGHBOURS, only_valid=True
         )
@@ -915,6 +1004,8 @@ def _phase4_integrate(
             _insert_candidate(store, cand, cand_emb, embedder, now)
             added += 1
 
+    progress.update(len(candidates))
+    progress.finish()
     journal.append(
         f"Phase 4: integrated {len(candidates)} candidates -> "
         f"added={added}, invalidated={invalidated}, deduped={deduped}, "
@@ -1143,7 +1234,9 @@ def _phase5_promote(
     ]
 
     # Cluster by simple greedy union-find on pairwise distance.
-    clusters = _cluster_notes(valid_notes, embeddings, dist_threshold=PROMOTION_CLUSTER_DIST)
+    clusters = _cluster_notes(
+        valid_notes, embeddings, dist_threshold=PROMOTION_CLUSTER_DIST, report_progress=True
+    )
 
     min_episodes = max(PROMOTION_MIN_EPISODES, config.promotion_min_episodes)
     min_notes = max(PROMOTION_MIN_NOTES, config.promotion_min_endorsing_notes)
@@ -1154,12 +1247,15 @@ def _phase5_promote(
         f"(need ≥{min_notes} notes across ≥{min_episodes} episodes)"
     )
 
-    for cluster in clusters:
-        if len(cluster) < min_notes:
-            continue
+    eligible = [
+        c for c in clusters
+        if len(c) >= min_notes
+        and len({eid for n in c for eid in n.source_episode_ids}) >= min_episodes
+    ]
+    progress = _Progress("Phase 5 promotion verdicts", len(eligible))
+    for cluster_index, cluster in enumerate(eligible):
+        progress.update(cluster_index)
         episode_ids = {eid for n in cluster for eid in n.source_episode_ids}
-        if len(episode_ids) < min_episodes:
-            continue
 
         # Ask the LLM whether this cluster is worth promoting and what key/value to use.
         cluster_payload = [{"id": n.id, "text": n.text} for n in cluster]
@@ -1191,6 +1287,8 @@ def _phase5_promote(
             f"({len(episode_ids)} episodes) -> profile.{_sanitise_profile_key(key)} = {value!r}"
         )
 
+    progress.update(len(eligible))
+    progress.finish()
     if promoted == 0:
         journal.append("Phase 5: no promotions this pass.")
     return promoted, tokens
@@ -1200,11 +1298,15 @@ def _cluster_notes(
     notes: List[Note],
     embeddings: List[List[float] | None],
     dist_threshold: float,
+    *,
+    report_progress: bool = False,
 ) -> List[List[Note]]:
     """Greedy union-find clustering on pairwise vector distance.
 
-    O(n^2) — fine up to a few thousand valid notes. Switch to HNSW or
-    incremental clustering when we outgrow that.
+    Still O(n^2) comparisons, but the pair search is vectorised with numpy
+    when it is installed (ADR-0020) — seconds instead of hours at ~14k notes.
+    Without numpy it falls back to the pure-Python loop. Both paths produce
+    the same connected components. Incremental clustering is the long-term fix.
     """
     n = len(notes)
     if n == 0:
@@ -1222,20 +1324,114 @@ def _cluster_notes(
         if ri != rj:
             parent[ri] = rj
 
-    for i in range(n):
-        if embeddings[i] is None:
-            continue
-        for j in range(i + 1, n):
-            if embeddings[j] is None:
-                continue
-            d = _euclid_distance(embeddings[i], embeddings[j])  # type: ignore[arg-type]
-            if d <= dist_threshold:
-                union(i, j)
+    for i, j in _close_pairs(embeddings, dist_threshold, report_progress=report_progress):
+        union(i, j)
 
     buckets: dict[int, List[Note]] = {}
     for i, note in enumerate(notes):
         buckets.setdefault(find(i), []).append(note)
     return [v for v in buckets.values() if len(v) > 1]  # singletons aren't clusters
+
+
+def _close_pairs(
+    embeddings: List[List[float] | None],
+    dist_threshold: float,
+    *,
+    report_progress: bool = False,
+) -> Iterable[Tuple[int, int]]:
+    """Return every (i, j), i < j, whose embeddings are within dist_threshold.
+
+    Missing embeddings never pair; embeddings of different dimension never
+    pair (matching _euclid_distance's inf). Uses numpy when available.
+    """
+    n = sum(1 for e in embeddings if e is not None)
+    backend = "numpy" if _np is not None else "pure-python"
+    progress = (
+        _Progress(f"Phase 5 clustering pairs ({backend})", n * (n - 1) // 2)
+        if report_progress else None
+    )
+    if _np is None:
+        pairs = _close_pairs_python(embeddings, dist_threshold, progress)
+    else:
+        pairs = _close_pairs_numpy(embeddings, dist_threshold, progress)
+    if progress is not None:
+        progress.update(progress.total)
+        progress.finish()
+    return pairs
+
+
+def _close_pairs_python(
+    embeddings: List[List[float] | None],
+    dist_threshold: float,
+    progress: "_Progress | None" = None,
+) -> List[Tuple[int, int]]:
+    pairs: List[Tuple[int, int]] = []
+    n = len(embeddings)
+    for i in range(n):
+        a = embeddings[i]
+        if progress is not None and a is not None:
+            # Pairs already compared = pairs among rows before i (approx; ignores None gaps).
+            progress.update(min(progress.total, i * n - i * (i + 1) // 2))
+        if a is None:
+            continue
+        for j in range(i + 1, n):
+            b = embeddings[j]
+            if b is None:
+                continue
+            if _euclid_distance(a, b) <= dist_threshold:
+                pairs.append((i, j))
+    return pairs
+
+
+# Rows per block in the vectorised pair search: 512 x 14k float64 ≈ 57 MB.
+_PAIR_BLOCK_ROWS = 512
+# Candidates within this margin of the threshold (via the fast |a|²+|b|²-2a·b
+# form) are re-checked with an exact difference, so borderline pairs land on
+# the same side as the pure-Python path.
+_PAIR_RECHECK_MARGIN = 1e-6
+
+
+def _close_pairs_numpy(
+    embeddings: List[List[float] | None],
+    dist_threshold: float,
+    progress: "_Progress | None" = None,
+) -> List[Tuple[int, int]]:
+    np = _np
+    assert np is not None
+    by_dim: dict[int, List[int]] = {}
+    for idx, emb in enumerate(embeddings):
+        if emb is not None:
+            by_dim.setdefault(len(emb), []).append(idx)
+
+    pairs: List[Tuple[int, int]] = []
+    loose = (dist_threshold + _PAIR_RECHECK_MARGIN) ** 2
+    compared = 0
+    for idxs in by_dim.values():
+        if len(idxs) < 2:
+            continue
+        index_map = np.asarray(idxs)
+        x = np.asarray([embeddings[i] for i in idxs], dtype=np.float64)
+        sq = np.einsum("ij,ij->i", x, x)
+        m = len(idxs)
+        cols = np.arange(m)
+        for start in range(0, m, _PAIR_BLOCK_ROWS):
+            stop = min(start + _PAIR_BLOCK_ROWS, m)
+            block = x[start:stop]
+            d2 = sq[start:stop, None] + sq[None, :] - 2.0 * (block @ x.T)
+            mask = d2 <= loose
+            mask &= cols[None, :] > np.arange(start, stop)[:, None]  # upper triangle only
+            rows, js = np.nonzero(mask)
+            # Pairs in this block's upper triangle: sum over rows r of (m - 1 - r).
+            compared += sum(m - 1 - r for r in range(start, stop))
+            if progress is not None:
+                progress.update(min(progress.total, compared))
+            if rows.size == 0:
+                continue
+            ii = rows + start
+            exact = np.sqrt(((x[ii] - x[js]) ** 2).sum(axis=1))
+            keep = exact <= dist_threshold
+            pairs.extend(zip(index_map[ii[keep]].tolist(), index_map[js[keep]].tolist()))
+    return pairs
 
 
 def _euclid_distance(a: List[float], b: List[float]) -> float:

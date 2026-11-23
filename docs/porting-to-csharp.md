@@ -62,7 +62,7 @@ To keep the port mechanical, the Python code stays clear of:
 - LangChain / LlamaIndex (no equivalents in .NET, and porting them would be huge)
 - Any Python-specific magic: descriptors, metaclasses, `__init_subclass__`, etc.
 - Async-only libs in the core (we use sync sqlite + sync openai-client)
-- Pickle, dill, numpy as a hard dep, anything that doesn't have a clean .NET counterpart
+- Pickle, dill, numpy as a hard dep (optional accelerators with a pure-Python fallback are fine, see ADR-0020), anything that doesn't have a clean .NET counterpart
 
 ## What you build first when porting
 

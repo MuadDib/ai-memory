@@ -30,6 +30,9 @@ dev = [
     "ruff>=0.5",
     "mypy>=1.10",
 ]
+fast = [
+    "numpy>=1.26",              # Vectorised Phase 5 clustering (ADR-0020); optional
+]
 local-embeddings = [
     "sentence-transformers>=3",
     "onnxruntime>=1.18",

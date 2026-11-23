@@ -37,7 +37,7 @@ Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
 
 py -3.11 -m venv .venv          # requires Python 3.11+; use py -3.12 if you have 3.12
 .\.venv\Scripts\Activate.ps1
-pip install -e .
+pip install -e ".[fast]"     # [fast] = numpy, makes Phase 5 clustering ~1000x faster (ADR-0020)
 
 # 2. Set your OpenAI API key
 # Current session only:
@@ -63,7 +63,7 @@ git clone https://github.com/MuadDib/ai-memory.git ~/ai-memory
 cd ~/ai-memory
 python3.11 -m venv .venv        # requires Python 3.11+
 source .venv/bin/activate
-pip install -e .
+pip install -e ".[fast]"     # [fast] = numpy, makes Phase 5 clustering ~1000x faster (ADR-0020)
 
 # 2. Set your OpenAI API key
 export OPENAI_API_KEY="sk-..."
