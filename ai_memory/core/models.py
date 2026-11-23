@@ -85,6 +85,10 @@ class Episode:
     raw_file: str = ""  # relative path within the raw/ tree
     embedding_model: str = ""
     consolidated_at: str | None = None  # None = not yet dreamed
+    # Watermark (ADR-0019): how many of this episode's turns, in turn order,
+    # Phase 3 has already extracted. When an imported session grows, only the
+    # turns after this point are extracted again. 0 = never extracted.
+    extracted_turns: int = 0
 
 
 @dataclass

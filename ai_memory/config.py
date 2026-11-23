@@ -78,6 +78,12 @@ class DreamConfig:
     # Turn count at or above which the quality_model is used for Phase 3
     # extraction on that episode.  0 = never upgrade.
     long_episode_turns: int = 100
+    # ADR-0019: when an already-dreamed episode grows, extract only the turns
+    # added since its last dream (plus a small overlap) and fold a summary of
+    # them into the existing one, instead of re-reading the whole transcript.
+    # The long_episode_turns upgrade then applies to the new turns only.
+    # False restores the old full re-extract on every growth.
+    incremental_extraction: bool = True
     # Hard ceiling on the input size (in tokens, ~4 chars each) of any single
     # Phase 3 LLM request.  Transcripts larger than this are summarised
     # map-reduce (chunk -> merge) instead of single-shot, so one long episode

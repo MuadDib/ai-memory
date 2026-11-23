@@ -32,7 +32,7 @@ Runtime data lives at `C:\ai-mem\data\` (`memory.db`, `profile.md`, `raw/YYYY/MM
 - **`../shared-ai-memory-proposal.md`** — the canonical design doc. Versioned via changelog blocks at the top. v4 (2026-04-27 afternoon) covers the recall-quality debug arc and the open follow-ups; v3 covers the build session; v2 covers the pre-build design with research synthesis from six existing-memory-MCP deep-dives.
 - **`README.md`** — install/wiring instructions and the current command surface.
 - **`docs/porting-to-csharp.md`** — the portability discipline that shapes module boundaries. Honour it when adding new code; if you cross it, justify it in the PR or in the proposal doc.
-- **`docs/decisions/`** — ADRs (one decision per file). Latest: **[ADR-0016 — Bounded Recency Boost and BM25 Stopwords](docs/decisions/0016-bounded-recency-and-bm25-stopwords.md)**, **[ADR-0017 — Exclude Scheduled-Task Runs](docs/decisions/0017-exclude-scheduled-task-runs.md)** and **[ADR-0018 — Disable Age-Based Pruning](docs/decisions/0018-disable-age-based-pruning.md)**.
+- **`docs/decisions/`** — ADRs (one decision per file). Latest: **[ADR-0016 — Bounded Recency Boost and BM25 Stopwords](docs/decisions/0016-bounded-recency-and-bm25-stopwords.md)**, **[ADR-0017 — Exclude Scheduled-Task Runs](docs/decisions/0017-exclude-scheduled-task-runs.md)**, **[ADR-0018 — Disable Age-Based Pruning](docs/decisions/0018-disable-age-based-pruning.md)** and **[ADR-0019 — Incremental Extraction for Growing Episodes](docs/decisions/0019-incremental-extraction.md)**.
 - **`docs/reviews/`** — point-in-time health audits of the live corpus. Latest committed: **[2026-06-07 Memory Health Review](docs/reviews/2026-06-07-memory-health-review.md)**. Weekly audits quote personal corpus content, so they live in `docs/reviews/private/`, which is gitignored and local-only (this repo is public). Latest: `docs/reviews/private/2026-10-28-weekly-health.md`.
 - **`docs/plans/`** — actionable remediation/work plans. Active: **[Dream-Cycle Deadlock Remediation](docs/plans/2026-06-07-dream-deadlock-remediation.md)**.
 
@@ -72,7 +72,7 @@ These are listed in proposal v3 + v4:
 
 Done: eval harness (27/27 passing); Phase 5 promotion prompt fix (external-entity guard + bad profile cleanup); bootstrap cross-file dedup (two-tier: 0.30 vector + mid-band LLM check up to 0.40 + mid-band LLM dedup); `backfill-entities` CLI subcommand (bootstrap entity backfill done: 41/89 notes now have entities); `redream` CLI subcommand (--episode, --latest, --all-pending, --keep-notes); auto-upgrade to gpt-4o for long episodes (>= 100 turns, Phase 3 only); eval suite expanded 17→27 cases (dedup regression + promotion quality + personal/technical breadth); Phase 4 dedup threshold 0.10→0.20 + DUPLICATE-biased verdict prompt; Pydantic output validation + retry; tag taxonomy redesign; bootstrap nesting fix; corpus reset + redream; ADR pattern enforced (12 ADRs in docs/decisions/); Horcrux lessons applied: recall merge-sort fix (episode hits now properly interleaved with note hits by score), structured Phase 3 failure log (EXTRACT_FAILURE lines in dream-log journal).
 
-Still pending from earlier: incremental Phase 3 dreaming, `remember --from-stdin`, cross-encoder rerank, local sentence-transformers embedder, Linux daemon mode.
+Still pending from earlier: `remember --from-stdin`, cross-encoder rerank, local sentence-transformers embedder, Linux daemon mode.
 
 ## Conventions
 

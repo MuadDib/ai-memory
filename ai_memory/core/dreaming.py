@@ -478,21 +478,45 @@ def dream(
                 journal.append(f"  Episode {ep.id}: scheduled-task run — skipped extraction.")
                 continue
 
-            transcript = _render_transcript(raw, turns)
+            # ADR-0019: an episode that was dreamed before and then grew only
+            # needs its new turns extracted. Re-reading the whole transcript
+            # made a long-lived session cost more on every pass.
+            start = _extraction_start(
+                total_turns=len(turns),
+                extracted_turns=ep.extracted_turns,
+                has_summary=bool(ep.summary),
+                enabled=config.incremental_extraction,
+            )
+            if start >= len(turns):
+                # Watermark says nothing is new (re-marked pending without new
+                # turns). Close it out without spending tokens.
+                ep.consolidated_at = now
+                store.update_episode(ep)
+                journal.append(
+                    f"  Episode {ep.id}: no turns after watermark "
+                    f"{ep.extracted_turns} — closed without extraction."
+                )
+                continue
+            work_turns = turns[start:]
+            incremental = start > 0
+            previous_summary = ep.summary
+
+            transcript = _render_transcript(raw, work_turns)
 
             # Select model: upgrade to quality_llm for long/dense episodes where
-            # better extraction quality is worth the extra cost.
+            # better extraction quality is worth the extra cost. Sized on the
+            # turns actually being read this pass, not the episode's total.
             long_threshold = (
                 config.long_episode_turns if config.long_episode_turns > 0 else 10**9
             )
             ep_llm = (
                 quality_llm
-                if quality_llm is not None and len(turns) >= long_threshold
+                if quality_llm is not None and len(work_turns) >= long_threshold
                 else llm
             )
             if ep_llm is not llm:
                 journal.append(
-                    f"  Episode {ep.id}: {len(turns)} turns >= {long_threshold} — "
+                    f"  Episode {ep.id}: {len(work_turns)} turns >= {long_threshold} — "
                     f"using quality model ({ep_llm.model_id}) for Phase 3."
                 )
 
@@ -507,10 +531,21 @@ def dream(
                 max_request_tokens=config.max_request_tokens,
             )
             tokens_used += summary_tokens
+            if incremental:
+                # Fold the new part's summary into the one already stored.
+                # Same reduce prompt as map-reduce, with the earlier summary
+                # as Part 1, so the result reads as one coherent paragraph.
+                if summary_completion.text.strip():
+                    summary_completion, merge_tokens = _merge_summaries(
+                        ep_llm=ep_llm,
+                        partials=[previous_summary, summary_completion.text.strip()],
+                    )
+                    tokens_used += merge_tokens
+                summary_mode = f"incremental({summary_mode}+merge)"
 
             # Extract: chunked. For short episodes _chunk_turns returns a single
             # window so behaviour is identical to the old single-shot path.
-            turn_chunks = _chunk_turns(turns)
+            turn_chunks = _chunk_turns(work_turns)
             all_facts: List[_ExtractedFact] = []
             chunk_sizes: List[int] = []
             chunk_warnings: List[str] = []  # structured failure log (Horcrux: typed failure result)
@@ -537,7 +572,10 @@ def dream(
                 chunk_sizes.append(len(chunk_facts))
 
             # Persist summary + mark consolidated only if we produced something.
-            ep.summary = summary_completion.text.strip()
+            # An incremental pass that produced no usable summary keeps the old one.
+            ep.summary = summary_completion.text.strip() or (
+                previous_summary if incremental else ""
+            )
 
             # Generate a proper short title from the summary.  A tiny dedicated
             # call (≈10 output tokens on gpt-4o-mini) gives far better results
@@ -562,6 +600,17 @@ def dream(
 
             if ep.summary or all_facts:
                 ep.consolidated_at = now
+                ep.extracted_turns = len(turns)
+                # Turns imported while this pass was running arrive with the
+                # episode still pending, so the importer doesn't re-mark it.
+                # Marking it consolidated now would strand them; leave it
+                # pending and the watermark makes the next pass read only them.
+                if len(store.get_turns_for_episode(ep.id)) > len(turns):
+                    ep.consolidated_at = None
+                    journal.append(
+                        f"  Episode {ep.id}: new turns arrived during the pass — "
+                        f"left pending from watermark {len(turns)}."
+                    )
 
             try:
                 [summary_embedding] = embedder.embed([ep.summary]) if ep.summary else [None]  # type: ignore[list-item]
@@ -594,7 +643,8 @@ def dream(
                 episodes_consolidated += 1
 
             journal.append(
-                f"  Episode {ep.id}: turns={len(turns)} chunks={len(turn_chunks)} "
+                f"  Episode {ep.id}: turns={len(turns)} "
+                f"read={len(work_turns)} (from turn {start + 1}) chunks={len(turn_chunks)} "
                 f"transcript_chars={len(transcript)} summary={len(ep.summary)} chars "
                 f"(mode={summary_mode} finish={summary_completion.finish_reason}"
                 f"{', refusal=' + summary_completion.refusal[:120] if summary_completion.refusal else ''}) "
@@ -1397,6 +1447,19 @@ def _summarise_episode(
             partials.append(c.text.strip())
 
     # Reduce: merge the partial summaries into one coherent paragraph.
+    final, merge_tokens = _merge_summaries(ep_llm=ep_llm, partials=partials)
+    total_tokens += merge_tokens
+    return final, total_tokens, f"map-reduce({len(chunks)} chunks)"
+
+
+def _merge_summaries(
+    *, ep_llm: "Llm", partials: List[str]
+) -> "Tuple[CompletionResult, int]":
+    """Merge ordered partial summaries into one paragraph (the reduce step).
+
+    Shared by map-reduce summarisation and ADR-0019 incremental passes, where
+    Part 1 is the episode's stored summary and Part 2 summarises the new turns.
+    """
     merged_input = "\n\n".join(f"[Part {i}] {p}" for i, p in enumerate(partials, start=1))
     final = ep_llm.complete(
         system=SUMMARY_SYSTEM,
@@ -1409,8 +1472,31 @@ def _summarise_episode(
         ))],
         max_tokens=1200,
     )
-    total_tokens += final.input_tokens + final.output_tokens
-    return final, total_tokens, f"map-reduce({len(chunks)} chunks)"
+    return final, final.input_tokens + final.output_tokens
+
+
+def _extraction_start(
+    *,
+    total_turns: int,
+    extracted_turns: int,
+    has_summary: bool,
+    enabled: bool,
+    overlap: int = EXTRACT_CHUNK_OVERLAP,
+) -> int:
+    """Index of the first turn Phase 3 should read for this episode (ADR-0019).
+
+    0 means a full extraction: first dream, incremental mode off, no stored
+    summary to extend, or a watermark that can't be trusted (beyond the turn
+    count, which only a reset or data repair could cause). Otherwise extraction
+    resumes `overlap` turns before the watermark, so a fact straddling the old
+    boundary is seen with its context; Phase 4 dedups what the overlap repeats.
+    Returns `total_turns` when nothing is new.
+    """
+    if not enabled or not has_summary or extracted_turns <= 0 or extracted_turns > total_turns:
+        return 0
+    if extracted_turns == total_turns:
+        return total_turns
+    return max(0, extracted_turns - overlap)
 
 
 def _llm_call_with_retry(

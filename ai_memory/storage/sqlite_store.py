@@ -71,7 +71,8 @@ CREATE TABLE IF NOT EXISTS episodes (
   ended_at          TEXT,
   raw_file          TEXT NOT NULL,
   embedding_model   TEXT NOT NULL,
-  consolidated_at   TEXT
+  consolidated_at   TEXT,
+  extracted_turns   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS episodes_started_at ON episodes(started_at);
@@ -132,7 +133,7 @@ CREATE INDEX IF NOT EXISTS eval_results_run_id  ON eval_results(run_id);
 CREATE INDEX IF NOT EXISTS eval_results_case_id ON eval_results(case_id, run_at);
 """
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Migration SQL run once when upgrading from schema version 1 (Unix int
 # timestamps) to version 2 (ISO 8601 UTC strings).  The WHERE guards make
@@ -210,6 +211,33 @@ CREATE INDEX IF NOT EXISTS eval_results_case_id ON eval_results(case_id, run_at)
 # Migration v3→v4: adds entities column to notes (domain-split tag taxonomy).
 _MIGRATION_V3_TO_V4 = """
 ALTER TABLE notes ADD COLUMN entities TEXT NOT NULL DEFAULT '[]';
+"""
+
+# Migration v4→v5 (ADR-0019): per-episode extraction watermark.
+_MIGRATION_V4_TO_V5_ADD = """
+ALTER TABLE episodes ADD COLUMN extracted_turns INTEGER NOT NULL DEFAULT 0;
+"""
+
+# Backfill, run after the column exists (also on a DB whose column was added
+# but not yet backfilled). Consolidated episodes were extracted in full.
+# A pending episode that has a summary was dreamed before and then grew; its
+# watermark is the number of turns that existed at its last dream, estimated as
+# the turns stamped no later than the newest note it produced (notes carry the
+# pass start time). With no such note it stays 0, a full re-extract, which is
+# the old behaviour. Phase 3's overlap absorbs an off-by-a-few estimate.
+_MIGRATION_V4_TO_V5_BACKFILL = """
+UPDATE episodes
+   SET extracted_turns = (SELECT COUNT(*) FROM turns t WHERE t.episode_id = episodes.id)
+ WHERE consolidated_at IS NOT NULL;
+
+UPDATE episodes
+   SET extracted_turns = COALESCE((
+         SELECT COUNT(*) FROM turns t
+          WHERE t.episode_id = episodes.id
+            AND t.ts <= (SELECT MAX(n.ingested_at) FROM notes n
+                          WHERE n.source_episode_ids LIKE '%' || episodes.id || '%')
+       ), 0)
+ WHERE consolidated_at IS NULL AND summary <> '';
 """
 
 
@@ -323,6 +351,13 @@ class SqliteStore:
             }
             if "entities" not in existing_cols:
                 conn.executescript(_MIGRATION_V3_TO_V4)
+        if current_version < 5:
+            episode_cols = {
+                r[1] for r in conn.execute("PRAGMA table_info(episodes)").fetchall()
+            }
+            if "extracted_turns" not in episode_cols:
+                conn.executescript(_MIGRATION_V4_TO_V5_ADD)
+            conn.executescript(_MIGRATION_V4_TO_V5_BACKFILL)
 
         # Record schema version (idempotent insert)
         conn.execute(
@@ -538,10 +573,10 @@ class SqliteStore:
                 """
                 INSERT INTO episodes(
                     id, title, summary, source, started_at, ended_at,
-                    raw_file, embedding_model, consolidated_at
+                    raw_file, embedding_model, consolidated_at, extracted_turns
                 ) VALUES (
                     :id, :title, :summary, :source, :started_at, :ended_at,
-                    :raw_file, :embedding_model, :consolidated_at
+                    :raw_file, :embedding_model, :consolidated_at, :extracted_turns
                 )
                 """,
                 episode.__dict__,
@@ -570,7 +605,8 @@ class SqliteStore:
                     ended_at        = :ended_at,
                     raw_file        = :raw_file,
                     embedding_model = :embedding_model,
-                    consolidated_at = :consolidated_at
+                    consolidated_at = :consolidated_at,
+                    extracted_turns = :extracted_turns
                 WHERE id = :id
                 """,
                 episode.__dict__,
@@ -654,8 +690,9 @@ class SqliteStore:
                     "DELETE FROM notes WHERE source_episode_ids LIKE ?", (pattern,)
                 )
                 deleted = len(note_rows)
+            # A redream is a full redo: clear the extraction watermark too.
             self.conn.execute(
-                "UPDATE episodes SET consolidated_at = NULL WHERE id = ?",
+                "UPDATE episodes SET consolidated_at = NULL, extracted_turns = 0 WHERE id = ?",
                 (episode_id,),
             )
             self.conn.commit()
@@ -677,7 +714,9 @@ class SqliteStore:
     def get_turns_for_episode(self, episode_id: str) -> list[Turn]:
         with self._lock:
             rows = self.conn.execute(
-                "SELECT * FROM turns WHERE episode_id = ? ORDER BY ts", (episode_id,)
+                # rowid breaks ts ties in insertion order, so the turn order (and
+                # with it the ADR-0019 extraction watermark) is deterministic.
+                "SELECT * FROM turns WHERE episode_id = ? ORDER BY ts, rowid", (episode_id,)
             ).fetchall()
         return [_row_to_turn(r) for r in rows]
 
@@ -864,6 +903,7 @@ def _row_to_episode(row: sqlite3.Row) -> Episode:
         raw_file=row["raw_file"],
         embedding_model=row["embedding_model"],
         consolidated_at=str(row["consolidated_at"]) if row["consolidated_at"] is not None else None,
+        extracted_turns=int(row["extracted_turns"] or 0),
     )
 
 
