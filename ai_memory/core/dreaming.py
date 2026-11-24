@@ -23,12 +23,14 @@ memories we'd switch to incremental clustering — deferred.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import timedelta
 from difflib import SequenceMatcher
 from typing import TYPE_CHECKING, Callable, Iterable, List, Literal, Tuple, TypeVar
 
@@ -1252,20 +1254,40 @@ def _phase5_promote(
         if len(c) >= min_notes
         and len({eid for n in c for eid in n.source_episode_ids}) >= min_episodes
     ]
-    progress = _Progress("Phase 5 promotion verdicts", len(eligible))
-    for cluster_index, cluster in enumerate(eligible):
+    # Verdict cache (ADR-0021): skip clusters whose exact membership was
+    # already declined by this prompt + model within the TTL.
+    promo_llm = quality_llm or llm
+    ttl_days = config.promotion_verdict_ttl_days
+    verdict_version = _promotion_verdict_version(promo_llm.model_id)
+    keyed = [(c, _promotion_cluster_key(c, verdict_version)) for c in eligible]
+    to_judge = keyed
+    if ttl_days > 0 and keyed:
+        cutoff = _iso_days_before(now, ttl_days)
+        pruned_verdicts = store.prune_promotion_verdicts(cutoff)
+        cached = store.get_promotion_verdicts([k for _, k in keyed])
+        to_judge = [(c, k) for c, k in keyed if k not in cached]
+        journal.append(
+            f"Phase 5: {len(eligible)} eligible clusters, {len(keyed) - len(to_judge)} "
+            f"skipped (declined before, unchanged), {len(to_judge)} to judge "
+            f"[verdict cache ttl={ttl_days}d, {pruned_verdicts} expired]"
+        )
+
+    progress = _Progress("Phase 5 promotion verdicts", len(to_judge))
+    for cluster_index, (cluster, cluster_key) in enumerate(to_judge):
         progress.update(cluster_index)
         episode_ids = {eid for n in cluster for eid in n.source_episode_ids}
 
         # Ask the LLM whether this cluster is worth promoting and what key/value to use.
         cluster_payload = [{"id": n.id, "text": n.text} for n in cluster]
+        verdict_warnings: List[str] = []
         promotion, promo_tokens = _llm_call_with_retry(
-            llm=quality_llm or llm,
+            llm=promo_llm,
             system=PROMOTION_SYSTEM,
             user_msg=json.dumps(cluster_payload, ensure_ascii=False),
             parse_fn=_parse_promotion,
             max_tokens=300,
             default=_PromotionResult(),
+            warnings=verdict_warnings,
         )
         tokens += promo_tokens
 
@@ -1273,7 +1295,11 @@ def _phase5_promote(
         value = (promotion.value or "").strip()
 
         if not key or not value:
-            continue  # LLM declined promotion
+            # LLM declined promotion. Cache it, unless the "decline" is really
+            # an unparseable response falling back to the default.
+            if ttl_days > 0 and not verdict_warnings:
+                store.record_promotion_verdict(cluster_key, len(cluster), "declined", now)
+            continue
 
         store.upsert_profile(
             Profile(key=_sanitise_profile_key(key), value=value, updated_at=now, source="dream")
@@ -1292,6 +1318,25 @@ def _phase5_promote(
     if promoted == 0:
         journal.append("Phase 5: no promotions this pass.")
     return promoted, tokens
+
+
+def _promotion_verdict_version(model_id: str) -> str:
+    """Fingerprint of what produced a verdict: the prompt text and the model.
+
+    Editing PROMOTION_SYSTEM or switching the promotion model changes every
+    cluster key, so the whole cache is effectively invalidated.
+    """
+    return hashlib.sha256(f"{model_id}\n{PROMOTION_SYSTEM}".encode()).hexdigest()[:16]
+
+
+def _promotion_cluster_key(cluster: List[Note], verdict_version: str) -> str:
+    """Cache key for a cluster: its exact member set plus the verdict version."""
+    members = "\n".join(sorted(n.id for n in cluster))
+    return hashlib.sha256(f"{verdict_version}\n{members}".encode()).hexdigest()
+
+
+def _iso_days_before(iso: str, days: int) -> str:
+    return (iso_to_dt(iso) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _cluster_notes(

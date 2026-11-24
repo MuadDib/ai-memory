@@ -84,6 +84,11 @@ class DreamConfig:
     # The long_episode_turns upgrade then applies to the new turns only.
     # False restores the old full re-extract on every growth.
     incremental_extraction: bool = True
+    # Phase 5 remembers clusters the promotion verdict already declined
+    # (keyed by exact note membership + prompt/model) and skips them until
+    # their membership changes or the verdict is this many days old
+    # (ADR-0021). 0 disables the cache and re-judges every cluster each pass.
+    promotion_verdict_ttl_days: int = 30
     # Hard ceiling on the input size (in tokens, ~4 chars each) of any single
     # Phase 3 LLM request.  Transcripts larger than this are summarised
     # map-reduce (chunk -> merge) instead of single-shot, so one long episode

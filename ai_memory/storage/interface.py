@@ -35,6 +35,20 @@ class MemoryStore(Protocol):
 
     def delete_profile(self, key: str) -> None: ...
 
+    # --- Phase 5 verdict cache (ADR-0021) --------------------------------
+
+    def get_promotion_verdicts(self, cluster_keys: list[str]) -> dict[str, str]:
+        """Return {cluster_key: judged_at} for keys with a cached verdict."""
+        ...
+
+    def record_promotion_verdict(
+        self, cluster_key: str, note_count: int, outcome: str, judged_at: str
+    ) -> None: ...
+
+    def prune_promotion_verdicts(self, judged_before: str) -> int:
+        """Delete cached verdicts judged before this ISO time. Returns rows deleted."""
+        ...
+
     def list_profile(self) -> list[Profile]: ...
 
     # --- Notes -----------------------------------------------------------

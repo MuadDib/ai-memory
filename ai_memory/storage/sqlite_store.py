@@ -131,9 +131,19 @@ CREATE TABLE IF NOT EXISTS eval_results (
 
 CREATE INDEX IF NOT EXISTS eval_results_run_id  ON eval_results(run_id);
 CREATE INDEX IF NOT EXISTS eval_results_case_id ON eval_results(case_id, run_at);
+
+-- Phase 5 verdict cache (ADR-0021): clusters the promotion verdict declined.
+-- cluster_key = hash of the sorted member note ids + prompt/model version, so
+-- any membership change produces a new key and the cluster is judged again.
+CREATE TABLE IF NOT EXISTS promotion_verdicts (
+  cluster_key  TEXT PRIMARY KEY,
+  note_count   INTEGER NOT NULL,
+  outcome      TEXT NOT NULL,       -- 'declined'
+  judged_at    TEXT NOT NULL        -- ISO 8601 UTC
+);
 """
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Migration SQL run once when upgrading from schema version 1 (Unix int
 # timestamps) to version 2 (ISO 8601 UTC strings).  The WHERE guards make
@@ -395,6 +405,49 @@ class SqliteStore:
                 profile.__dict__,
             )
             self.conn.commit()
+
+    # --- Phase 5 verdict cache (ADR-0021) --------------------------------
+
+    def get_promotion_verdicts(self, cluster_keys: list[str]) -> dict[str, str]:
+        """Return {cluster_key: judged_at} for the keys that have a cached verdict."""
+        found: dict[str, str] = {}
+        with self._lock:
+            for start in range(0, len(cluster_keys), 500):
+                batch = cluster_keys[start:start + 500]
+                placeholders = ",".join("?" * len(batch))
+                for row in self.conn.execute(
+                    f"SELECT cluster_key, judged_at FROM promotion_verdicts "
+                    f"WHERE cluster_key IN ({placeholders})",
+                    batch,
+                ):
+                    found[row["cluster_key"]] = row["judged_at"]
+        return found
+
+    def record_promotion_verdict(
+        self, cluster_key: str, note_count: int, outcome: str, judged_at: str
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO promotion_verdicts(cluster_key, note_count, outcome, judged_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(cluster_key) DO UPDATE SET
+                  note_count = excluded.note_count,
+                  outcome    = excluded.outcome,
+                  judged_at  = excluded.judged_at
+                """,
+                (cluster_key, note_count, outcome, judged_at),
+            )
+            self.conn.commit()
+
+    def prune_promotion_verdicts(self, judged_before: str) -> int:
+        """Delete cached verdicts older than `judged_before`. Returns rows deleted."""
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM promotion_verdicts WHERE judged_at < ?", (judged_before,)
+            )
+            self.conn.commit()
+            return cur.rowcount
 
     def delete_profile(self, key: str) -> None:
         with self._lock:
